@@ -21,8 +21,8 @@ Ambiente distribuído com balanceamento de carga (Nginx) entre dois servidores d
 | VM  | Hostname | Papel                | IP host-only    | vCPU | RAM     | Sistema             |
 |-----|----------|----------------------|-----------------|------|---------|---------------------|
 | VM1 | lb       | Nginx balanceador    | 192.168.56.10   | 1    | 1024 MB | Ubuntu Server 26.04.1 LTS (kernel 7.0.0-34) |
-| VM2 | —        | Servidor A           | —               | —    | —       | —                   |
-| VM3 | —        | Servidor B           | —               | —    | —       | —                   |
+| VM2 | srv-a    | Servidor A           | 192.168.56.11   | 1    | 1024 MB | Ubuntu Server 26.04.1 LTS (kernel 7.0.0-34) |
+| VM3 | srv-b    | Servidor B           | 192.168.56.12   | 1    | 1024 MB | Ubuntu Server 26.04.1 LTS (kernel 7.0.0-34) |
 
 - **Hypervisor:** Oracle VirtualBox
 - **Usuário administrativo:** `ram`
@@ -35,6 +35,10 @@ monitoramento-nginx/
 ├── README.md          # registro do projeto (este arquivo)
 ├── GUIA.md            # comandos e conceitos para estudo
 ├── lb/                # configs da VM1 (balanceador)
+│   └── netplan.yaml
+├── srv-a/             # configs da VM2 (servidor A)
+│   └── netplan.yaml
+├── srv-b/             # configs da VM3 (servidor B)
 │   └── netplan.yaml
 └── docs/prints/       # evidências (capturas de tela)
 ```
@@ -139,6 +143,82 @@ scp ram@192.168.56.10:~/00-installer-config.yaml lb/netplan.yaml
 ```
 
 ![Cópia e commit da config](docs/prints/vm1-git.webp)
+
+### 2. Criação da VM2 (srv-a) e VM3 (srv-b) por clonagem
+
+As duas VMs foram clonadas da VM1, que já estava instalada, atualizada e com firewall. Clonar economiza a instalação, mas o clone sai **idêntico** à original, por isso tudo o que identifica a máquina foi trocado.
+
+**Clonagem no VirtualBox** (com a VM1 desligada: `sudo poweroff`)
+- Botão direito na VM1 → **Clone**, com os nomes `srv-a` e `srv-b`.
+- **MAC Address Policy:** *Generate new MAC addresses for all network adapters* (MAC repetido causa conflito na rede).
+- **Full clone** (disco independente da original).
+
+**Ajustes em cada clone**
+Feitos pela janela do VirtualBox, com a VM1 desligada, porque o clone liga com o mesmo IP `.10` da VM1.
+
+```bash
+# identidade
+sudo hostnamectl set-hostname srv-a             # srv-b na VM3
+sudo nano /etc/hosts                            # linha 127.0.1.1: lb → srv-a
+
+# machine-id: identificador único da instalação; clones herdam o mesmo
+sudo rm -f /etc/machine-id /var/lib/dbus/machine-id
+sudo systemd-machine-id-setup
+sudo ln -sf /etc/machine-id /var/lib/dbus/machine-id
+
+# chaves SSH do servidor: cada máquina precisa das suas
+sudo rm /etc/ssh/ssh_host_*
+sudo dpkg-reconfigure openssh-server
+
+# IP fixo
+sudo nano /etc/netplan/00-installer-config.yaml # 192.168.56.11/24 (srv-a) ou .12/24 (srv-b)
+sudo netplan apply
+sudo reboot
+```
+
+| Item         | VM1 (original) | VM2 (srv-a) | VM3 (srv-b) |
+|--------------|----------------|-------------|-------------|
+| Hostname     | lb             | srv-a       | srv-b       |
+| IP host-only | .10            | .11         | .12         |
+| MAC          | original       | novo        | novo        |
+| machine-id   | original       | novo        | novo        |
+| Chaves SSH   | originais      | novas       | novas       |
+
+O firewall veio da VM1 já com o SSH liberado, então não precisou ser refeito.
+
+**Verificação** (do PC, com as três VMs ligadas)
+```bash
+ping -c 2 192.168.56.10
+ping -c 2 192.168.56.11
+ping -c 2 192.168.56.12
+ssh ram@192.168.56.11 "hostnamectl --static; ip -4 addr show enp0s8 | grep inet"
+ssh ram@192.168.56.12 "hostnamectl --static; ip -4 addr show enp0s8 | grep inet"
+```
+Resultado: as três VMs respondem, cada uma com IP e hostname próprios. ✅
+
+**Comunicação entre as VMs** (ping a partir do `srv-a`)
+
+![Ping do srv-a para as três VMs](docs/prints/vm2-ping.png)
+
+| Destino            | Perda | Tempo médio | Observação |
+|--------------------|-------|-------------|------------|
+| 192.168.56.10 (lb)    | 0%    | ~0,45 ms    | Alcança o balanceador |
+| 192.168.56.11 (srv-a) | 0%    | ~0,05 ms    | Ela mesma: o pacote não sai da máquina, por isso é ~10× mais rápido |
+| 192.168.56.12 (srv-b) | 0%    | ~0,52 ms    | Alcança o outro servidor |
+
+- **0% packet loss:** nenhum pacote perdido; a rede host-only está estável.
+- **`ttl=64`:** valor inicial do Linux, sem nenhum decréscimo. Ou seja, nenhum roteador no caminho: as três VMs estão na mesma rede, comunicando-se direto.
+- Isso confirma o pré-requisito do balanceamento: o `lb` vai alcançar `srv-a` e `srv-b` pela host-only.
+
+**Config versionada**
+```bash
+# em cada VM: refazer a cópia, porque a que está na home veio da VM1 (IP antigo)
+sudo cp /etc/netplan/00-installer-config.yaml ~/ && sudo chown $USER ~/00-installer-config.yaml
+# no PC
+mkdir -p srv-a srv-b
+scp ram@192.168.56.11:~/00-installer-config.yaml srv-a/netplan.yaml
+scp ram@192.168.56.12:~/00-installer-config.yaml srv-b/netplan.yaml
+```
 
 ## Dificuldades
 

@@ -99,10 +99,32 @@ sudo ufw allow from IP to any port N proto tcp   # libera porta só para um IP d
 - `inet 192.168.56.10/24`: IP e máscara.
 - `valid_lft forever`: IP estático. Com DHCP apareceria um tempo em segundos (prazo do empréstimo).
 
+**`ping -c N IP`:** envia N pacotes e para (sem `-c`, roda até `Ctrl+C`).
+- `0% packet loss`: todos voltaram. Perda constante indica rede ou firewall com problema.
+- `time=0.5 ms`: tempo de ida e volta. Ping para o próprio IP é bem mais rápido porque o pacote não sai da máquina.
+- `ttl=64`: o Linux começa com 64 e cada roteador no caminho tira 1. Chegou 64 = mesma rede, sem roteador.
+- `rtt min/avg/max/mdev`: menor, média, maior e variação dos tempos.
+
 **`scp`:** a barra `100%` e o tamanho em bytes confirmam a cópia. Pede a senha da VM porque usa SSH.
 
 **`git commit`:** `[main 085978c]` = branch e ID curto do commit · `create mode 100644` = arquivo novo com permissão normal.
 **`git push`:** `ee06e3e..085978c main -> main` = o remoto avançou do commit antigo para o novo.
+
+## Clonar VMs
+
+Clone = cópia idêntica. O que precisa mudar para não haver duas máquinas "iguais" na rede:
+
+| Item | Por que trocar | Como |
+|------|----------------|------|
+| MAC | Dois MACs iguais na mesma rede = pacotes vão para a máquina errada | Na clonagem: *Generate new MAC addresses* |
+| Hostname | Identificação nos logs, no prompt e no Prometheus | `hostnamectl set-hostname` + `/etc/hosts` |
+| machine-id | ID único da instalação; DHCP e logs confundem clones | Apagar `/etc/machine-id` + `systemd-machine-id-setup` |
+| Chaves SSH | O PC acharia que é o mesmo servidor | Apagar `/etc/ssh/ssh_host_*` + `dpkg-reconfigure openssh-server` |
+| IP fixo | Dois IPs iguais = conflito | Editar o netplan |
+
+- **Full clone:** disco independente. **Linked clone:** depende do disco da original (mais leve, mas frágil).
+- Ajuste o clone pela janela do VirtualBox com a original desligada: os dois ligam com o mesmo IP.
+- Se o SSH do PC reclamar `REMOTE HOST IDENTIFICATION HAS CHANGED`, é porque a chave do servidor mudou: `ssh-keygen -R IP` apaga a chave antiga salva no PC.
 
 ## VirtualBox — problemas comuns
 
