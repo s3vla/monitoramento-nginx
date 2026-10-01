@@ -227,6 +227,42 @@ node_cpu_seconds_total{cpu="0",mode="idle"} 5021.3
 
 **ufw com várias portas:** `sudo ufw allow from IP to any port 9100,9113 proto tcp` (lista com vírgula exige `proto`).
 
+## Docker Compose
+
+Compose sobe vários containers descritos num único arquivo `docker-compose.yml`. Rodar sempre **na pasta onde está o arquivo**.
+
+```bash
+docker compose up -d          # cria e sobe tudo em segundo plano (-d = detached)
+docker compose ps             # estado dos containers
+docker compose logs -f prometheus   # logs ao vivo de um serviço (Ctrl+C sai)
+docker compose restart prometheus   # reinicia um serviço (ex.: depois de editar o prometheus.yml)
+docker compose down           # para e remove os containers (os volumes ficam)
+docker compose down -v        # remove também os volumes: APAGA métricas e dashboards
+```
+- `image`: de onde vem o programa · `volumes`: arquivos do PC dentro do container (`:ro` = só leitura) ou volumes nomeados (dados persistentes) · `command`: parâmetros do programa · `restart: unless-stopped`: sobe com o PC.
+- `network_mode: host`: o container usa a rede do PC (sem mapear portas; a coluna PORTS do `ps` fica vazia).
+
+## Prometheus
+
+- **Pull:** o Prometheus busca as métricas em cada alvo (`scrape`) a cada `scrape_interval`.
+- **Job:** grupo de alvos do mesmo tipo (`node`, `nginx`). **Target:** um IP:porta. **Labels:** rótulos que identificam e filtram.
+- Páginas: `localhost:9090/targets` (estado dos alvos) · `localhost:9090/query` (consultas).
+
+**Recarregar a config sem reiniciar** (graças a `--web.enable-lifecycle`):
+```bash
+curl -X POST localhost:9090/-/reload
+```
+
+**PromQL básico:**
+```promql
+up                              # 1 = coleta ok, 0 = falhou (uma série por alvo)
+up{vm="srv-a"}                  # filtra pelo rótulo
+up{job="nginx"} == 0            # só os alvos Nginx que estão fora
+node_load1                      # gauge: usa direto
+rate(nginx_http_requests_total[1m])   # counter: requisições por segundo, média do último minuto
+sum by (vm) (rate(...[1m]))     # soma agrupando por VM
+```
+
 ## Clonar VMs
 
 Clone = cópia idêntica. O que precisa mudar para não haver duas máquinas "iguais" na rede:

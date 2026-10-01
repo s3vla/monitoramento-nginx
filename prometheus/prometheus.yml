@@ -1,0 +1,26 @@
+# Prometheus: o que coletar, de onde e com qual frequência
+
+global:
+  scrape_interval: 5s          # coleta a cada 5 s (curto, para ver os testes de carga quase em tempo real)
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Node Exporter: métricas da máquina (CPU, memória, disco, carga, rede)
+  - job_name: node
+    static_configs:
+      - targets: ['192.168.56.10:9100']
+        labels: { vm: lb,    papel: balanceador }
+      - targets: ['192.168.56.11:9100']
+        labels: { vm: srv-a, papel: servidor-a }
+      - targets: ['192.168.56.12:9100']
+        labels: { vm: srv-b, papel: servidor-b }
+
+  # Nginx Prometheus Exporter: métricas do Nginx (requisições e conexões)
+  - job_name: nginx
+    static_configs:
+      - targets: ['192.168.56.10:9113']
+        labels: { vm: lb,    papel: balanceador }
+      - targets: ['192.168.56.11:9113']
+        labels: { vm: srv-a, papel: servidor-a }
+      - targets: ['192.168.56.12:9113']
+        labels: { vm: srv-b, papel: servidor-b }

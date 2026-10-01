@@ -14,10 +14,11 @@ Ambiente distribuído com **balanceamento de carga** (Nginx) entre dois servidor
 8. [Etapa 5 — Nginx nos servidores A e B](#etapa-5--nginx-nos-servidores-a-e-b)
 9. [Etapa 6 — Nginx balanceador no lb](#etapa-6--nginx-balanceador-no-lb)
 10. [Etapa 7 — Exporters nas três VMs](#etapa-7--exporters-nas-três-vms)
-11. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
-12. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
-13. [Dificuldades e soluções](#dificuldades-e-soluções)
-14. [Próximas etapas](#próximas-etapas)
+11. [Etapa 8 — Prometheus no PC](#etapa-8--prometheus-no-pc)
+12. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
+13. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
+14. [Dificuldades e soluções](#dificuldades-e-soluções)
+15. [Próximas etapas](#próximas-etapas)
 
 ---
 
@@ -73,6 +74,8 @@ Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `
 | Aplicação | srv-a, srv-b | `127.0.0.1:5000` | Somente a própria VM (Nginx local) |
 | Node Exporter | todas as VMs | `*:9100` | Somente o PC (Prometheus), pelo firewall |
 | Nginx Prometheus Exporter | todas as VMs | `*:9113` | Somente o PC (Prometheus), pelo firewall |
+| Prometheus | PC (Docker) | `localhost:9090` | Navegador do PC |
+| Grafana    | PC (Docker) | `localhost:3000` | Navegador do PC |
 
 ### Versões
 
@@ -85,6 +88,10 @@ Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `
 | Python        | 3.14.4 |
 | Node Exporter | pacote `prometheus-node-exporter` do Ubuntu |
 | Nginx Prometheus Exporter | pacote `prometheus-nginx-exporter` do Ubuntu |
+| PC (host)     | Arch Linux |
+| Docker / Compose | 29.8.1 / 5.5.1 |
+| Prometheus    | imagem `prom/prometheus:latest` |
+| Grafana OSS   | imagem `grafana/grafana-oss:latest` |
 | curl          | 8.18.0 |
 | Usuário admin | `ram` |
 
@@ -94,6 +101,9 @@ Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `
 monitoramento-nginx/
 ├── README.md            # este passo a passo
 ├── GUIA.md              # comandos e conceitos explicados (estudo)
+├── docker-compose.yml   # sobe Prometheus e Grafana no PC
+├── prometheus/
+│   └── prometheus.yml   # os 6 alvos e os rótulos
 ├── lb/netplan.yaml      # rede da VM1
 ├── srv-a/netplan.yaml   # rede da VM2
 ├── srv-b/netplan.yaml   # rede da VM3
@@ -772,6 +782,104 @@ git push
 
 ---
 
+## Etapa 8 — Prometheus no PC
+
+O Prometheus roda no **PC**, em Docker, e coleta a cada 5 s as métricas dos 6 exporters das VMs. O mesmo `docker-compose.yml` já sobe o Grafana, usado na etapa 9.
+
+```
+PC ─ Docker ─┬─ Prometheus (localhost:9090) ──coleta a cada 5 s──► 6 exporters nas VMs
+             └─ Grafana    (localhost:3000) ──consulta──► Prometheus
+```
+
+### Por que Docker
+
+- Nada instalado direto no PC: sobe e remove com um comando.
+- A configuração fica toda no repositório (`docker-compose.yml` + `prometheus.yml`): qualquer integrante do grupo reproduz o ambiente igual.
+- O enunciado permite: *"inclusive por contêiner se desejado"*.
+
+### O `docker-compose.yml`
+
+| Trecho | Para quê |
+|--------|----------|
+| `image: prom/prometheus` / `grafana/grafana-oss` | Imagens oficiais, edições gratuitas e open source |
+| `network_mode: host` | Containers usam a rede do PC: saem para as VMs com o IP `192.168.56.1`, o mesmo liberado no firewall dos exporters |
+| `./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro` | Usa a config do repositório, somente leitura (`ro`) |
+| `prometheus-data` / `grafana-data` | Volumes: métricas e dashboards sobrevivem a reinícios |
+| `--storage.tsdb.retention.time=15d` | Guarda 15 dias de histórico |
+| `--web.enable-lifecycle` | Permite recarregar a config sem reiniciar o container |
+| `restart: unless-stopped` | Sobe de novo sozinho após reiniciar o PC |
+
+### O `prometheus.yml`
+
+```yaml
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: node                      # 3 alvos na porta 9100
+    static_configs:
+      - targets: ['192.168.56.10:9100']
+        labels: { vm: lb, papel: balanceador }
+      # ... srv-a (.11) e srv-b (.12)
+  - job_name: nginx                     # 3 alvos na porta 9113
+    # ... mesmos rótulos
+```
+
+| Item | Para quê |
+|------|----------|
+| `scrape_interval: 5s` | Coleta curta: os testes de carga aparecem quase em tempo real (o padrão é 1 min) |
+| `job_name: node` / `nginx` | Separa os alvos por tipo de exporter; vira o rótulo `job` |
+| `targets` | IP:porta de cada exporter |
+| `labels: vm, papel` | Rótulos próprios que distinguem **balanceador, servidor A e servidor B**, como pede o enunciado. Nos dashboards, filtra-se por `vm="srv-a"` em vez de decorar IPs |
+
+### 8.1 Subir os containers
+
+🖥️ **PC** (na pasta do repositório)
+```bash
+mkdir -p prometheus
+mv ~/Downloads/docker-compose.yml .
+mv ~/Downloads/prometheus.yml prometheus/
+docker compose up -d       # baixa as imagens e sobe em segundo plano
+docker compose ps          # os dois containers "Up"
+```
+
+![docker compose up](docs/prints/prom-compose-up.png)
+
+A coluna `PORTS` fica vazia por causa do `network_mode: host`: os containers não mapeiam portas, usam as do próprio PC.
+
+### 8.2 Conferir os 6 alvos
+
+🖥️ **PC** → navegador: **http://localhost:9090/targets** (*Status → Target health*)
+
+![Targets](docs/prints/prom-targets.png)
+
+- **nginx 3/3 up** e **node 3/3 up**: os 6 alvos coletando.
+- Cada alvo com `instance`, `job`, `papel` e `vm`.
+- *Last scrape* de poucos segundos atrás confirma a coleta a cada 5 s.
+
+### 8.3 Consulta `up`
+
+🖥️ **PC** → navegador: **http://localhost:9090/query** → digitar `up` → *Execute*
+
+![Consulta up](docs/prints/prom-query-up.png)
+
+`up` é uma métrica que o **próprio Prometheus** cria para cada alvo: **1** = a última coleta funcionou, **0** = falhou. As **6 séries com valor 1** comprovam todos os alvos UP.
+
+Pelo terminal:
+```bash
+curl -s localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"' | sort | uniq -c   # 6 "health":"up"
+```
+
+### 8.4 Versionar
+
+🖥️ **PC**
+```bash
+git add .
+git commit -m "feat: Prometheus com os 6 alvos via Docker Compose"
+git push
+```
+
+---
+
 ## Roteiro de demonstração ao professor
 
 Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**.
@@ -830,11 +938,21 @@ Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**
 | 28 | 📦 VM `lb` | `curl --max-time 3 http://192.168.56.11:9100/metrics` | **Timeout**: só o PC acessa os exporters |
 | 29 | 📦 qualquer VM | `sudo ufw status` | Portas 9100 e 9113 liberadas só para `192.168.56.1` |
 
-### F. Repositório
+### F. Prometheus
+
+| # | Onde rodar | Comando / ação | Mostrar / explicar |
+|---|------------|----------------|--------------------|
+| 30 | 🖥️ PC | `docker compose ps` | Prometheus e Grafana rodando em containers |
+| 31 | 🖥️ PC | `cat prometheus/prometheus.yml` | 2 jobs × 3 alvos, rótulos `vm` e `papel`, coleta a cada 5 s |
+| 32 | 🖥️ PC (navegador) | `localhost:9090/targets` | **6 alvos UP** |
+| 33 | 🖥️ PC (navegador) | consulta `up` | 6 séries com valor 1 |
+| 34 | 🖥️ PC (navegador) | consulta `up{vm="srv-a"}` | Os rótulos filtram uma VM específica |
+
+### G. Repositório
 
 | # | Onde | O que mostrar |
 |---|------|---------------|
-| 30 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/`, `exporters/` com as configs |
+| 35 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/`, `exporters/`, `prometheus/` e o `docker-compose.yml` |
 
 ---
 
@@ -897,6 +1015,21 @@ O `stub_status` só é lido pelo exporter da própria VM, então não precisa sa
 **Por que instalar pelos pacotes do Ubuntu?**
 Já vêm com o serviço systemd configurado (sobe no boot, religa se cair) e são atualizados pelo `apt`. São as versões open source exigidas.
 
+**Por que o Prometheus no PC e em Docker?**
+O enunciado permite rodar no computador local, inclusive em contêiner. Com Docker, nada é instalado no PC e toda a configuração fica versionada; qualquer integrante sobe o mesmo ambiente com `docker compose up -d`.
+
+**Por que `network_mode: host`?**
+Os containers usam a rede do PC diretamente, então o Prometheus chega às VMs pela host-only com o IP `192.168.56.1`, exatamente o liberado no firewall dos exporters. Sem isso, o tráfego passaria por uma rede interna do Docker.
+
+**Para que servem os rótulos `vm` e `papel`?**
+O enunciado pede rótulos que distingam balanceador, servidor A e servidor B. Com eles, as consultas e os dashboards filtram por nome (`vm="srv-a"`) em vez de IP, e a legenda dos gráficos fica legível.
+
+**Por que coletar a cada 5 s?**
+O padrão (1 min) é lento para testes de carga de poucos minutos. Com 5 s, as mudanças aparecem quase em tempo real, e o `rate(...[1m])` tem 12 amostras por janela.
+
+**O que é a métrica `up`?**
+É criada pelo próprio Prometheus para cada alvo: 1 se a última coleta funcionou, 0 se falhou. É a base do painel de estado dos alvos.
+
 **Como vocês provam que a porta 5000 não é acessível?**
 `ss` mostra que ela escuta só em `127.0.0.1`, e o `curl` de fora (PC ou outra VM) falha por timeout, porque o firewall descarta o pacote.
 
@@ -928,6 +1061,6 @@ Já vêm com o serviço systemd configurado (sobe no boot, religa se cair) e sã
 - [x] Nginx em `srv-a` e `srv-b` como proxy reverso para `127.0.0.1:5000` + `stub_status`
 - [x] Nginx balanceador no `lb` (upstream round robin) + `stub_status`
 - [x] Node Exporter e Nginx Prometheus Exporter nas três VMs (acesso restrito ao PC)
-- [ ] Prometheus no PC: 6 alvos UP com rótulos
+- [x] Prometheus no PC: 6 alvos UP com rótulos
 - [ ] Grafana: dashboards de infraestrutura e de Nginx/HTTP
 - [ ] Experimentos: carga normal, aumento de carga, falha de backend, estratégia alternativa
