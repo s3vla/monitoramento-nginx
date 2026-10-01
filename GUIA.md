@@ -141,6 +141,43 @@ ss -tlnp                             # portas TCP escutando (t=TCP, l=listen, n=
 - Saída vazia logo após `restart`: o serviço ainda estava subindo; tente de novo ou veja o `status`.
 - Use `http://`, não `https://`, quando o serviço não tem certificado.
 
+## Nginx
+
+**Proxy reverso:** fica na frente de outro serviço, recebe a requisição e repassa (`proxy_pass`). O cliente só enxerga o Nginx.
+
+```bash
+sudo nginx -t                    # valida a sintaxe; SEMPRE antes de aplicar
+sudo systemctl reload nginx      # aplica sem derrubar conexões (restart derruba)
+sudo ln -s /etc/nginx/sites-available/X /etc/nginx/sites-enabled/   # ativa um site
+sudo rm /etc/nginx/sites-enabled/X                                    # desativa (o original continua em available)
+```
+- `sites-available/`: onde os arquivos ficam · `sites-enabled/`: atalhos para os que o Nginx carrega.
+- O site `default` também usa a porta 80: remover para não conflitar.
+- Bloco `server { listen ...; location /caminho { ... } }`: um `server` por porta/site; `location` decide o que fazer com cada caminho.
+- `listen 80` = todas as interfaces · `listen 127.0.0.1:8080` = só local.
+- `allow IP; deny all;`: controle de acesso dentro do próprio Nginx (uma trava extra além do firewall).
+
+**Lendo o `stub_status`:**
+```
+Active connections: 1            # conexões abertas agora
+server accepts handled requests
+ 2 2 2                           # totais desde o início: conexões aceitas, tratadas, requisições
+Reading: 0 Writing: 1 Waiting: 0 # lendo pedido / enviando resposta / ociosas (keep-alive)
+```
+`accepts` maior que `handled` = conexões descartadas (limite atingido).
+
+**`curl -i`:** mostra os cabeçalhos da resposta. `Server: nginx` indica que passou pelo Nginx; cabeçalhos próprios (`X-Backend`) ajudam a identificar quem respondeu.
+
+**Firewall por origem:**
+```bash
+sudo ufw allow from 192.168.56.10 to any port 80 proto tcp   # só esse IP acessa a porta 80
+sudo ufw status numbered                                      # lista com números
+sudo ufw delete N                                             # apaga a regra N
+```
+Ordem obrigatória: `from IP` → `to any` → `port N` → `proto tcp`. Faltando a porta: "Wrong number of arguments".
+
+**Dica de terminal:** ↑ traz o comando anterior para corrigir só o erro de digitação, em vez de redigitar.
+
 ## Clonar VMs
 
 Clone = cópia idêntica. O que precisa mudar para não haver duas máquinas "iguais" na rede:

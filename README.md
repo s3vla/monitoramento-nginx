@@ -11,10 +11,11 @@ Ambiente distribuído com **balanceamento de carga** (Nginx) entre dois servidor
 5. [Etapa 2 — Configurar a VM1 (lb)](#etapa-2--configurar-a-vm1-lb)
 6. [Etapa 3 — Clonar a VM2 (srv-a) e a VM3 (srv-b)](#etapa-3--clonar-a-vm2-srv-a-e-a-vm3-srv-b)
 7. [Etapa 4 — Aplicação nos servidores A e B](#etapa-4--aplicação-nos-servidores-a-e-b)
-8. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
-9. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
-10. [Dificuldades e soluções](#dificuldades-e-soluções)
-11. [Próximas etapas](#próximas-etapas)
+8. [Etapa 5 — Nginx nos servidores A e B](#etapa-5--nginx-nos-servidores-a-e-b)
+9. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
+10. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
+11. [Dificuldades e soluções](#dificuldades-e-soluções)
+12. [Próximas etapas](#próximas-etapas)
 
 ---
 
@@ -63,6 +64,8 @@ Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `
 | Serviço   | Onde         | Escuta em        | Quem acessa |
 |-----------|--------------|------------------|-------------|
 | SSH       | todas as VMs | `0.0.0.0:22`     | PC (administração) |
+| Nginx (site) | srv-a, srv-b | `0.0.0.0:80`   | Somente o `lb` (192.168.56.10), pelo firewall |
+| Nginx `stub_status` | srv-a, srv-b | `127.0.0.1:8080` | Somente a própria VM (exporter local) |
 | Aplicação | srv-a, srv-b | `127.0.0.1:5000` | Somente a própria VM (Nginx local) |
 
 ### Versões
@@ -72,6 +75,7 @@ Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `
 | Hypervisor    | Oracle VirtualBox |
 | Sistema       | Ubuntu Server 26.04.1 LTS |
 | Kernel        | 7.0.0-34-generic |
+| Nginx         | 1.28.3 (Open Source) |
 | Python        | 3.14.4 |
 | curl          | 8.18.0 |
 | Usuário admin | `ram` |
@@ -88,6 +92,8 @@ monitoramento-nginx/
 ├── app/
 │   ├── app.py           # aplicação dos servidores A e B
 │   └── app.service      # serviço systemd da aplicação
+├── nginx/
+│   └── backend.conf     # Nginx dos servidores A e B (proxy reverso + stub_status)
 └── docs/prints/         # evidências (capturas de tela)
 ```
 
@@ -432,6 +438,122 @@ São **duas camadas de proteção**: a aplicação só escuta no loopback **e** 
 
 ---
 
+## Etapa 5 — Nginx nos servidores A e B
+
+Cada servidor ganha um Nginx na frente da aplicação. Ele é a **única porta de entrada** da VM: recebe a requisição do balanceador na porta 80 e repassa para a aplicação em `127.0.0.1:5000`. O enunciado exige isso: o balanceador nunca fala direto com a aplicação.
+
+```
+lb ──► srv-a:80 (Nginx) ──proxy_pass──► 127.0.0.1:5000 (app)
+                │
+                └─ 127.0.0.1:8080/nginx_status ──► exporter (etapa 7)
+```
+
+### O arquivo de configuração
+
+`nginx/backend.conf` (o **mesmo** nas duas VMs) tem dois blocos `server`:
+
+| Bloco | Escuta em | Função |
+|-------|-----------|--------|
+| Site principal | `80` | `proxy_pass` para `127.0.0.1:5000`, preservando cabeçalhos |
+| Status | `127.0.0.1:8080` | `stub_status` em `/nginx_status`, só para a própria VM |
+
+| Diretiva | Para quê |
+|----------|----------|
+| `proxy_pass http://127.0.0.1:5000;` | Repassa a requisição para a aplicação local |
+| `proxy_set_header Host $host;` | A aplicação recebe o nome/IP que o cliente pediu |
+| `proxy_set_header X-Real-IP $remote_addr;` | IP de quem falou com este Nginx (o `lb`) |
+| `proxy_set_header X-Forwarded-For ...;` | Cadeia de IPs: cliente → lb → backend |
+| `proxy_set_header X-Forwarded-Proto $scheme;` | Protocolo original (http/https) |
+| `add_header X-Backend $hostname always;` | Cabeçalho na resposta dizendo qual VM respondeu |
+| `listen 127.0.0.1:8080;` + `allow 127.0.0.1; deny all;` | Status invisível para a rede (duas travas) |
+| `stub_status;` | Contadores de conexões e requisições, lidos pelo exporter |
+
+**Por que preservar cabeçalhos:** sem eles, para a aplicação toda requisição pareceria vir de `127.0.0.1` (o próprio Nginx), e a origem real se perderia.
+
+### 5.1 Enviar o arquivo para as VMs
+
+🖥️ **PC** (na pasta do repositório)
+```bash
+mkdir -p nginx
+mv ~/Downloads/backend.conf nginx/
+scp nginx/backend.conf ram@192.168.56.11:~/
+scp nginx/backend.conf ram@192.168.56.12:~/
+```
+
+### 5.2 Instalar e ativar o Nginx
+
+📦 **VM `srv-a`** e depois 📦 **VM `srv-b`** (comandos idênticos)
+```bash
+sudo apt install -y nginx
+sudo mv ~/backend.conf /etc/nginx/sites-available/backend
+sudo ln -s /etc/nginx/sites-available/backend /etc/nginx/sites-enabled/   # ativa o site (atalho)
+sudo rm /etc/nginx/sites-enabled/default                                  # remove o site padrão (também usava a porta 80)
+sudo nginx -t                                                             # valida a sintaxe ANTES de aplicar
+sudo systemctl reload nginx                                               # aplica sem derrubar conexões
+sudo ufw allow from 192.168.56.10 to any port 80 proto tcp                # porta 80 só para o lb
+```
+
+**`sites-available` × `sites-enabled`:** o arquivo fica em `sites-available`; o atalho (`ln -s`) em `sites-enabled` é o que o Nginx carrega. Para desativar um site, basta apagar o atalho.
+
+![Instalação e testes no srv-b](docs/prints/nginx-backend-config.png)
+
+### 5.3 Testar dentro de cada VM
+
+📦 **VM `srv-a`** e 📦 **VM `srv-b`**
+```bash
+curl -i http://127.0.0.1/                   # passa pelo Nginx até a aplicação
+curl http://127.0.0.1:8080/nginx_status     # contadores do stub_status
+ss -tlnp | grep -E ':80|:8080'
+```
+
+![Proxy no srv-a](docs/prints/nginx-srv-a-proxy.png)
+
+- **`curl -i`**: o `-i` mostra os cabeçalhos. `Server: nginx/1.28.3` e `X-Backend: srv-a` provam que a resposta passou pelo Nginx; o corpo veio da aplicação.
+- **`nginx_status`**:
+  - `Active connections`: conexões abertas agora.
+  - `accepts handled requests`: totais de conexões aceitas, conexões tratadas e requisições.
+  - `Reading / Writing / Waiting`: conexões lendo a requisição, escrevendo a resposta e ociosas (keep-alive).
+- **`ss`**: `0.0.0.0:80` (site, aberto à rede, filtrado pelo firewall) e `127.0.0.1:8080` (status, só local).
+
+### 5.4 Testar a partir do balanceador
+
+📦 **VM `lb`**
+```bash
+curl http://192.168.56.11/       # "Servidor A"
+curl http://192.168.56.12/       # "Servidor B"
+```
+
+![lb alcançando os dois backends](docs/prints/nginx-lb-para-backends.png)
+
+O `lb` alcança o Nginx dos dois servidores pela rede: é exatamente o caminho que o `upstream` vai usar na etapa 6.
+
+### 5.5 Provar que só o lb acessa os backends
+
+🖥️ **PC**
+```bash
+curl --max-time 3 http://192.168.56.11/    # timeout
+```
+
+![PC bloqueado](docs/prints/nginx-pc-bloqueado.png)
+
+| Origem | Porta 80 do srv-a | Por quê |
+|--------|-------------------|---------|
+| 📦 `lb` (192.168.56.10) | ✅ responde | Regra `ufw allow from 192.168.56.10 to any port 80` |
+| 🖥️ PC (192.168.56.1) | ❌ timeout | Não está na regra: o firewall descarta |
+
+Assim, todo tráfego para os servidores **obrigatoriamente passa pelo balanceador**, e as métricas do `lb` refletem todas as requisições.
+
+### 5.6 Versionar
+
+🖥️ **PC**
+```bash
+git add .
+git commit -m "feat: Nginx como proxy reverso nos servidores A e B"
+git push
+```
+
+---
+
 ## Roteiro de demonstração ao professor
 
 Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**.
@@ -460,11 +582,22 @@ Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**
 | 13 | 🖥️ **PC** | `curl --max-time 3 http://192.168.56.11:5000/` | **Falha** (timeout): a porta interna não é acessível pela rede |
 | 14 | 📦 VM `srv-a` | `systemctl status app --no-pager` | Roda como serviço: sobe no boot, religa se cair |
 
-### C. Repositório
+### C. Nginx nos servidores
+
+| # | Onde rodar | Comando | Mostrar / explicar |
+|---|------------|---------|--------------------|
+| 15 | 📦 VM `srv-a` | `cat /etc/nginx/sites-available/backend` | `proxy_pass` para `127.0.0.1:5000`, cabeçalhos preservados, `stub_status` em `127.0.0.1:8080` |
+| 16 | 📦 VM `srv-a` | `curl -i http://127.0.0.1/` | `Server: nginx` e `X-Backend: srv-a`: passou pelo Nginx até a aplicação |
+| 17 | 📦 VM `srv-a` | `curl http://127.0.0.1:8080/nginx_status` | Contadores que o exporter vai ler |
+| 18 | 📦 VM `lb` | `curl http://192.168.56.11/` e `.12/` | O balanceador alcança os dois backends |
+| 19 | 🖥️ **PC** | `curl --max-time 3 http://192.168.56.11/` | **Timeout**: só o `lb` pode acessar os backends |
+| 20 | 📦 VM `srv-a` | `sudo ufw status` | Regra da porta 80 restrita a `192.168.56.10` |
+
+### D. Repositório
 
 | # | Onde | O que mostrar |
 |---|------|---------------|
-| 15 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/` com as configs |
+| 21 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/` com as configs |
 
 ---
 
@@ -494,6 +627,15 @@ Já vem no Ubuntu, sem dependências. Atende a todas as rotas pedidas com um arq
 **Por que systemd?**
 A aplicação sobe sozinha no boot, religa se cair e roda com um usuário sem privilégios (`www-data`).
 
+**Por que um Nginx em cada servidor, e não o lb direto na aplicação?**
+O enunciado exige. Além disso, a aplicação fica isolada no loopback, e o Nginx de cada servidor fornece o `stub_status` para medir o tráfego de A e de B separadamente, o que permite comparar a distribuição do round robin.
+
+**Por que o stub_status em 127.0.0.1:8080, separado do site?**
+Só o exporter da própria VM precisa lê-lo. Numa porta separada e no loopback, ele fica invisível para a rede e não se mistura com o tráfego da aplicação.
+
+**Por que a porta 80 dos servidores só aceita o lb?**
+Para que todo o tráfego passe pelo balanceador. Se o PC pudesse acessar A e B direto, haveria requisições fora do balanceamento e as métricas ficariam distorcidas.
+
 **Como vocês provam que a porta 5000 não é acessível?**
 `ss` mostra que ela escuta só em `127.0.0.1`, e o `curl` de fora (PC ou outra VM) falha por timeout, porque o firewall descarta o pacote.
 
@@ -512,6 +654,8 @@ A aplicação sobe sozinha no boot, religa se cair e roda com um usuário sem pr
 | App instalada no `lb` por engano | Terminal conectado na VM errada | Conferir o hostname no prompt |
 | Nome saía só "Servidor" | `Environment=APP_NAME=Servidor A` é cortado no espaço | Aspas: `Environment="APP_NAME=Servidor A"` |
 | `curl` sem resposta logo após o `restart` | A aplicação ainda estava subindo | `systemctl status app` e `curl -v` |
+| `ufw: ERROR: Wrong number of arguments` | Faltou o número da porta na regra | `sudo ufw allow from 192.168.56.10 to any port 80 proto tcp` |
+| `curl: Protocol "htt" not supported` / `Bad hostname` | Erro de digitação (`htt://`, `=i` em vez de `-i`) | Conferir o comando; usar ↑ para editar o anterior |
 
 ---
 
@@ -519,7 +663,7 @@ A aplicação sobe sozinha no boot, religa se cair e roda com um usuário sem pr
 
 - [x] VMs, rede, hostname, SSH e firewall
 - [x] Aplicação em A e B (somente loopback)
-- [ ] Nginx em `srv-a` e `srv-b` como proxy reverso para `127.0.0.1:5000` + `stub_status`
+- [x] Nginx em `srv-a` e `srv-b` como proxy reverso para `127.0.0.1:5000` + `stub_status`
 - [ ] Nginx balanceador no `lb` (upstream round robin) + `stub_status`
 - [ ] Node Exporter e Nginx Prometheus Exporter nas três VMs (acesso restrito ao PC)
 - [ ] Prometheus no PC: 6 alvos UP com rótulos
