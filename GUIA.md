@@ -263,6 +263,36 @@ rate(nginx_http_requests_total[1m])   # counter: requisições por segundo, méd
 sum by (vm) (rate(...[1m]))     # soma agrupando por VM
 ```
 
+## Testes de carga (hey)
+
+```bash
+alias hey='docker run --rm --network host williamyeh/hey'   # hey via Docker (vale para o terminal atual)
+hey -n 20 -c 5 URL              # 20 requisições, 5 simultâneas
+hey -z 3m -c 5 -q 4 URL         # 3 minutos, 5 clientes, 4 req/s por cliente (= 20 req/s)
+hey -z 1m -c 10 "URL?n=50000"   # aspas quando a URL tem ? ou &
+```
+- `-n` total · `-z` duração · `-c` concorrência · `-q` limite por cliente. `-n` não pode ser menor que `-c`.
+- **Resumo:** `Requests/sec` (vazão) · `Average` (latência média) · `95% in` (p95: 95% responderam até esse tempo) · `Status code distribution` (`[200]` = ok).
+
+**Média × percentil:** a média esconde os casos ruins; o p95/p99 mostra o que os clientes mais azarados sentem. Em saturação, a média sobe devagar e o p95 dispara.
+
+**Saturação e Lei de Little:** `clientes simultâneos ≈ vazão × latência`. Quando a CPU chega a ~100%, a vazão para de crescer; mais clientes viram fila, e a latência cresce na mesma proporção (dobrar clientes → dobrar latência).
+
+**Correlacionar eventos:** `date` antes de cada ação (parar serviço, iniciar teste) registra o horário para achar no gráfico. Atenção a relógios diferentes entre máquinas (`timedatectl` mostra o horário e se o NTP está ativo).
+
+## Algoritmos de balanceamento (Nginx)
+
+| Algoritmo | Diretiva | Quando usar |
+|-----------|----------|-------------|
+| Round robin | (padrão) | Servidores iguais |
+| Peso | `server IP weight=3;` | Servidores com capacidades diferentes (peso proporcional à capacidade) |
+| Menos conexões | `least_conn;` | Requisições de duração variável ou servidores de velocidades diferentes |
+| Hash do IP | `ip_hash;` | O mesmo cliente precisa cair sempre no mesmo servidor (sessão) |
+
+Peso em servidores iguais satura o de peso maior e deixa o outro ocioso: a vazão total cai.
+
+**Falha de backend (verificação passiva):** `max_fails=1 fail_timeout=10s` tira o servidor da rotação por 10 s após 1 falha; `proxy_next_upstream error timeout` reenvia a requisição ao próximo. Log: `sudo tail /var/log/nginx/error.log` → `connect() failed (111: Connection refused) while connecting to upstream`.
+
 ## Clonar VMs
 
 Clone = cópia idêntica. O que precisa mudar para não haver duas máquinas "iguais" na rede:

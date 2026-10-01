@@ -16,10 +16,12 @@ Ambiente distribuído com **balanceamento de carga** (Nginx) entre dois servidor
 10. [Etapa 7 — Exporters nas três VMs](#etapa-7--exporters-nas-três-vms)
 11. [Etapa 8 — Prometheus no PC](#etapa-8--prometheus-no-pc)
 12. [Etapa 9 — Grafana e dashboards](#etapa-9--grafana-e-dashboards)
-13. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
-14. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
-15. [Dificuldades e soluções](#dificuldades-e-soluções)
-16. [Próximas etapas](#próximas-etapas)
+13. [Etapa 10 — Experimentos](#etapa-10--experimentos)
+14. [Análise: resultados, limitações e melhorias](#análise-resultados-limitações-e-melhorias)
+15. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
+16. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
+17. [Dificuldades e soluções](#dificuldades-e-soluções)
+18. [Entrega: checklist do enunciado](#entrega-checklist-do-enunciado)
 
 ---
 
@@ -95,6 +97,7 @@ Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `
 | Docker / Compose | 29.8.1 / 5.5.1 |
 | Prometheus    | imagem `prom/prometheus:latest` |
 | Grafana OSS   | imagem `grafana/grafana-oss:latest` |
+| Gerador de carga | `hey`, via imagem Docker `williamyeh/hey` |
 | curl          | 8.18.0 |
 | Usuário admin | `ram` |
 
@@ -1035,6 +1038,246 @@ git push
 
 ---
 
+## Etapa 10 — Experimentos
+
+### Ferramenta de carga
+
+**`hey`** (gerador de carga HTTP), rodando no **PC** em Docker. O pacote do AUR (`hey-bin`) estava quebrado (download com erro 403), então foi usada a imagem Docker:
+
+🖥️ **PC**
+```bash
+alias hey='docker run --rm --network host williamyeh/hey'   # vale para o terminal atual
+hey -n 20 -c 5 http://192.168.56.10/                         # teste rápido
+```
+- `--network host`: o tráfego sai pelo PC (`192.168.56.1`), o IP liberado no firewall do `lb`.
+- Nesta versão do `hey`, o total (`-n`) não pode ser menor que a concorrência (`-c`, padrão 50).
+
+| Opção do `hey` | Significado |
+|----------------|-------------|
+| `-z 3m` | Duração do teste |
+| `-c 5` | Concorrência: clientes simultâneos |
+| `-q 4` | Limite de requisições por segundo **por cliente** (5 × 4 = 20 req/s no total) |
+| `-n 20` | Total de requisições (quando não se usa `-z`) |
+
+**Como ler o resumo do `hey`:** `Requests/sec` = vazão; `Average` / `Slowest` = latência média e pior caso; `95% in` = 95% das requisições responderam até esse tempo; `Status code distribution` = códigos HTTP (`[200]` = sucesso). O `hey` mede a **latência**, que o `stub_status` do Nginx não fornece.
+
+![Teste do hey](docs/prints/exp0-hey-teste.png)
+
+### Resumo dos cenários
+
+| # | Cenário | Rota | Duração | Concorrência | Taxa |
+|---|---------|------|---------|--------------|------|
+| 1 | Funcionamento normal | `/` | 3 min | 5 | 20 req/s (limitada com `-q 4`) |
+| 2 | Aumento de carga | `/carga?n=50000` | 4 × 1 min | 2 → 5 → 10 → 20 | Sem limite |
+| 3 | Falha de um backend | `/` | 3 min | 5 | 20 req/s; Nginx do `srv-a` parado por ~45 s |
+| 4 | Estratégia alternativa | `/carga?n=50000` | 2 min | 5 | Sem limite; `weight=3` no `srv-a` |
+
+---
+
+### Cenário 1 — Funcionamento normal
+
+**Objetivo:** mostrar a alternância e uma distribuição compatível com round robin sob carga moderada.
+
+🖥️ **PC**
+```bash
+hey -z 3m -c 5 -q 4 http://192.168.56.10/
+```
+
+![Cenário 1: Nginx](docs/prints/exp1-nginx.png)
+![Cenário 1: conexões](docs/prints/exp1-conexoes.png)
+![Cenário 1: infraestrutura](docs/prints/exp1-infra.png)
+
+| Medida | Resultado |
+|--------|-----------|
+| Requisições | 3600, todas **200** (0 erros) |
+| Vazão | 20,0 req/s |
+| Latência | média 5,6 ms · p95 7,6 ms · p99 9,5 ms |
+| Taxa por Nginx | `lb` ~20 req/s · `srv-a` ~10 · `srv-b` ~10 |
+| Distribuição | **50% / 50%** |
+| CPU | ~9–12% nas três VMs (≈ linha de base de 10%) |
+| Rede | `lb` até 17,7 kB/s recebidos; A e B ~5,8 kB/s cada |
+
+**Interpretação:**
+- O round robin dividiu o tráfego **igualmente**: cada backend recebeu metade.
+- Carga **leve** para o ambiente: a CPU quase não saiu da linha de base, e a latência ficou abaixo de 10 ms.
+- **Conexões:** o `lb` tem 6 conexões ativas (as 5 do `hey`, reaproveitadas com keep-alive, + 1 do exporter), e a taxa de conexões aceitas nele fica perto de zero. Já em A e B, as conexões aceitas acompanham as requisições (~10 c/s): **o `lb` abre uma conexão nova com o backend a cada requisição** (ver [melhorias](#melhorias-possíveis)).
+
+---
+
+### Cenário 2 — Aumento de carga
+
+**Objetivo:** elevar a concorrência aos poucos e observar requisições, conexões, CPU e rede. Usa a rota `/carga`, que gasta CPU de propósito (~40 ms por requisição).
+
+🖥️ **PC**
+```bash
+for c in 2 5 10 20; do
+  echo "===== concorrência $c"
+  hey -z 1m -c $c "http://192.168.56.10/carga?n=50000" | grep -E "Requests/sec|Average|95% in|\[[0-9]+\]"
+done
+```
+
+![Cenário 2: saída do hey (c = 2, 5, 10)](docs/prints/exp2-infra-parcial.png)
+![Cenário 2: saída do hey (c = 20)](docs/prints/exp2-hey-c20.png)
+![Cenário 2: Nginx](docs/prints/exp2-nginx-parcial.png)
+![Cenários 2 e 3: infraestrutura](docs/prints/exp2-3-infra.png)
+
+| Concorrência | Vazão | Latência média | p95 | Erros |
+|--------------|-------|----------------|-----|-------|
+| 2  | 52,7 req/s | 38 ms  | 83 ms  | 0 |
+| 5  | 53,5 req/s | 93 ms  | 211 ms | 0 |
+| 10 | 52,6 req/s | 190 ms | 409 ms | 0 |
+| 20 | 50,7 req/s | 390 ms | 1,40 s | 0 |
+
+| Componente | Comportamento |
+|------------|---------------|
+| CPU de A e B | Sobe de ~10% para **~97–98%** e fica lá |
+| CPU do `lb` | ~12% (máx. 16,5%) |
+| `node_load1` de A e B | Até ~1,9 (fila esperando a única vCPU) |
+| Requisições | ~26–27 req/s por backend; distribuição 50% / 50% |
+| Conexões ativas / em escrita | Crescem com a concorrência (até ~20 por Nginx) |
+| Rede | `lb` até ~46 kB/s recebidos e ~61 kB/s transmitidos |
+
+**Interpretação:**
+- **Os backends saturam já com 2 clientes.** Cada requisição gasta ~40 ms de CPU e cada VM tem 1 vCPU, então cada backend aguenta ~26 req/s, e os dois juntos ~53 req/s.
+- A partir daí, **mais clientes não aumentam a vazão, só aumentam a fila**: a latência dobra a cada vez que a concorrência dobra. Os números seguem a relação **latência ≈ clientes ÷ vazão** (Lei de Little): 2/52,7 = 38 ms · 5/53,5 = 93 ms · 10/52,6 = 190 ms · 20/50,7 = 395 ms.
+- Com 20 clientes, a vazão chega a **cair um pouco** (a CPU gasta tempo alternando entre processos) e a cauda da latência dispara (p95 de 1,4 s, máximo ~4,4 s).
+- **O gargalo são os backends, não o balanceador:** o `lb` ficou com ~12% de CPU.
+- Mesmo saturado, o sistema **não perdeu nenhuma requisição**: ficou lento, mas não falhou.
+
+---
+
+### Cenário 3 — Falha de um backend
+
+**Objetivo:** interromper o servidor A durante a carga, observar o impacto e a recuperação.
+
+**Terminal 1, 🖥️ PC**
+```bash
+date; hey -z 3m -c 5 -q 4 http://192.168.56.10/
+```
+**Terminal 2, 📦 VM `srv-a`** (com o `hey` rodando)
+```bash
+date; sudo systemctl stop nginx     # ~1 min depois do início
+date; sudo systemctl start nginx    # ~45 s depois
+```
+
+![Cenário 3: parada e retorno do Nginx do srv-a](docs/prints/exp3-parada.png)
+
+**Depois do teste, 📦 VM `lb`**
+```bash
+sudo grep -c "Connection refused" /var/log/nginx/error.log
+sudo tail -3 /var/log/nginx/error.log
+```
+
+![Cenário 3: resumo do hey e log do lb](docs/prints/exp3-hey-log.png)
+![Cenário 3: Nginx](docs/prints/exp3-nginx.png)
+
+| Medida | Resultado |
+|--------|-----------|
+| Requisições | 3600, todas **200**: **nenhum erro chegou ao cliente** |
+| Latência | média 6,2 ms · p99 10,9 ms · máximo 50,6 ms |
+| Log do `lb` | **5** × `connect() failed (111: Connection refused) while connecting to upstream`, às 02:39:53, 02:40:04 e 02:40:15 (~11 s de intervalo) |
+| Taxa por Nginx | `lb` constante em ~20 req/s; `srv-b` sobe até **18,2 req/s**; `srv-a` cai e depois volta |
+| Distribuição no período | 37% A / 63% B |
+| `nginx_up` do `srv-a` | 0 enquanto o Nginx estava parado; 1 após o retorno |
+
+**Interpretação (comportamento do Nginx):**
+1. **Detecção:** ao tentar o A, o `lb` recebe *Connection refused* imediatamente (nada escuta na porta 80).
+2. **Desvio:** com `proxy_next_upstream error`, a **mesma requisição** é reenviada ao B. O cliente recebe 200, só alguns milissegundos mais tarde (o máximo de 50 ms).
+3. **Exclusão temporária:** com `max_fails=1 fail_timeout=10s`, o A fica 10 s fora da rotação. O log mostra exatamente isso: tentativas a cada ~11 s, só **5 falhas** em ~45 s de queda.
+4. **Recuperação:** quando o A volta, a próxima tentativa funciona e a distribuição retorna a 50/50 sem nenhuma intervenção.
+
+**Observações:**
+- A linha do A **não chega a zero** e desce em "V": o `rate(...[1m])` é a média do último minuto, e a queda real durou só 45 s. Uma janela menor (`[15s]`) mostraria a queda mais nítida.
+- O painel `nginx_up` mostra o **último** valor; durante a queda ele ficou em 0 (DOWN).
+- Os horários do log das VMs estão **~3–4 min atrasados** em relação ao PC (as VMs não sincronizam o relógio). Os gráficos não são afetados, porque usam o horário do Prometheus, que roda no PC.
+
+---
+
+### Cenário 4 — Estratégia alternativa: pesos
+
+**Objetivo:** alterar o algoritmo e comparar com o round robin. Foi dado **peso 3 ao servidor A** (A recebe 3 de cada 4 requisições) e repetida a carga do Cenário 2 com concorrência 5.
+
+**📦 VM `lb`:** em `/etc/nginx/sites-available/lb`, na linha do `srv-a`:
+```nginx
+server 192.168.56.11:80 weight=3 max_fails=1 fail_timeout=10s;
+```
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+![Cenário 4: configuração com peso](docs/prints/exp4-config.png)
+
+🖥️ **PC**
+```bash
+for i in $(seq 8); do curl -s http://192.168.56.10/ | grep -o '"servidor": "[^"]*"'; done
+hey -z 2m -c 5 "http://192.168.56.10/carga?n=50000"
+```
+
+![Cenário 4: distribuição e resumo do hey](docs/prints/exp4-hey.png)
+![Cenário 4: Nginx](docs/prints/exp4-nginx.png)
+![Cenário 4: infraestrutura](docs/prints/exp4-infra.png)
+
+Depois do teste, o `weight=3` foi removido e o Nginx recarregado (volta ao round robin):
+
+![Cenário 4: configuração revertida](docs/prints/exp4-revertido.png)
+
+**Comparação com o round robin (mesma carga: `/carga`, concorrência 5):**
+
+| Medida | Round robin (Cenário 2, c=5) | Peso 3:1 (Cenário 4) | Diferença |
+|--------|------------------------------|----------------------|-----------|
+| Distribuição | 50% / 50% | **74% A / 26% B** | — |
+| Vazão total | 53,5 req/s | **40,8 req/s** | **−24%** |
+| Latência média | 93 ms | **122 ms** | **+31%** |
+| p95 | 211 ms | 213 ms | ≈ |
+| CPU do A | ~97% | **100%** | — |
+| CPU do B | ~97% | **até 41%** | B ocioso |
+| `node_load1` | A e B ~1,9 | A 1,17 · B 0,47 | — |
+| Erros | 0 | 0 | — |
+
+**Interpretação:**
+- O peso funcionou: a sequência mostra o padrão **A, B, A, A, A, B, A...** e a pizza ficou em **74/26**, perto dos 75/25 esperados.
+- **Com servidores iguais, o peso piorou o resultado.** O A saturou (100% de CPU, ~31 req/s, seu limite) enquanto o B ficou mais da metade do tempo ocioso. A vazão total caiu 24%, porque o sistema passou a ser limitado só pela capacidade do A.
+- **Quando o peso faz sentido:** com servidores **diferentes**, por exemplo um com 3 vCPUs e outro com 1. Aí o peso proporcional à capacidade equilibra a carga real.
+- **Conclusão:** para A e B idênticos, o **round robin** é a escolha certa. Outra alternativa seria `least_conn` (envia para quem tem menos conexões abertas), que se adapta sozinho quando um servidor fica lento.
+
+---
+
+## Análise: resultados, limitações e melhorias
+
+### Resultados
+
+| Cenário | O que se esperava | O que aconteceu |
+|---------|-------------------|-----------------|
+| 1. Normal | Alternância e distribuição de round robin | 50% / 50%, 0 erros, latência < 10 ms |
+| 2. Aumento de carga | Mudanças em requisições, conexões, CPU e rede | Saturação de CPU em A e B (~98%) a ~53 req/s; latência crescendo proporcionalmente à concorrência; `lb` folgado |
+| 3. Falha de backend | Impacto, comportamento do Nginx e recuperação | B absorveu todo o tráfego, 0 erros para o cliente, A excluído por 10 s a cada falha, recuperação automática |
+| 4. Estratégia alternativa | Comparação justificada | Peso 3:1 levou a 74/26, −24% de vazão e +31% de latência: pior para servidores iguais |
+
+### Limitações
+
+- **`stub_status` não mostra códigos HTTP, latência nem qual backend respondeu.** A latência veio do `hey`, e o backend aparece só nos cabeçalhos (`X-Upstream`, `X-Backend`), não no Prometheus.
+- **Linha de base de 0,2 req/s:** as leituras do próprio exporter contam como requisições no Nginx.
+- **`rate(...[1m])` suaviza eventos curtos:** a queda de 45 s do Cenário 3 aparece como um "V", sem chegar a zero.
+- **Verificação passiva de saúde:** o Nginx Open Source só descobre que um backend caiu quando uma requisição real falha; não há *health check* ativo (recurso do Nginx Plus).
+- **Sem keep-alive entre o `lb` e os backends:** uma conexão TCP nova por requisição (visível em "conexões aceitas" de A e B).
+- **Relógios das VMs dessincronizados** (~3–4 min), o que dificulta cruzar logs.
+- **Ambiente num único computador:** VMs, Prometheus, Grafana e gerador de carga disputam o mesmo hardware, o que pode influenciar os números.
+- **Aplicação com 1 processo Python por VM:** não aproveitaria mais de um núcleo.
+
+### Melhorias possíveis
+
+| Melhoria | Como | Benefício |
+|----------|------|-----------|
+| Keep-alive no upstream | `keepalive 16;` no `upstream` + `proxy_http_version 1.1;` e `proxy_set_header Connection "";` | Reaproveita conexões `lb` → backend; menos latência e CPU |
+| Latência e códigos HTTP no Prometheus | Log do Nginx com `$upstream_response_time` e `$status` + exportador de logs, ou métricas na própria aplicação | Painéis de latência, erros por classe e falhas por upstream |
+| Janela menor no `rate` | `[15s]` ou `$__rate_interval` | Eventos curtos aparecem com nitidez |
+| Alertas | Regras do Prometheus/Grafana para `up == 0`, `nginx_up == 0`, CPU > 90% | Aviso automático em vez de olhar o painel |
+| Sincronizar relógios | `timedatectl set-ntp true` nas VMs | Logs comparáveis entre máquinas |
+| `least_conn` | `least_conn;` no `upstream` | Adapta-se a backends de velocidades diferentes |
+| Escalar a aplicação | Mais vCPUs e mais processos (ex.: Gunicorn com vários *workers*) ou um terceiro backend | Mais vazão antes da saturação |
+
+---
+
 ## Roteiro de demonstração ao professor
 
 Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**.
@@ -1114,11 +1357,21 @@ Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**
 | 39 | 🖥️ PC (navegador) | Ícone ⓘ / *Edit* nos painéis de CPU, requisições e memória | Explicar as 3 consultas PromQL (seção 9.6) |
 | 40 | 🖥️ PC (navegador) | Painel de requisições sem tráfego | Linha de base de 0,2 req/s = o próprio exporter |
 
-### H. Repositório
+### H. Experimentos (ao vivo)
+
+| # | Onde rodar | Comando | Mostrar / explicar |
+|---|------------|---------|--------------------|
+| 41 | 🖥️ PC | `alias hey='docker run --rm --network host williamyeh/hey'` | Ferramenta de carga |
+| 42 | 🖥️ PC | `hey -z 1m -c 5 -q 4 http://192.168.56.10/` | Cenário 1 rápido: A e B sobrepostos, pizza 50/50 |
+| 43 | 🖥️ PC + 📦 VM `srv-a` | `hey -z 2m -c 5 -q 4 http://192.168.56.10/` e, no meio, `sudo systemctl stop nginx` / `start nginx` | Cenário 3 ao vivo: B absorve tudo, `hey` sem erros, recuperação |
+| 44 | 📦 VM `lb` | `sudo tail -3 /var/log/nginx/error.log` | *Connection refused* espaçado de ~10 s (`fail_timeout`) |
+| 45 | README | Tabelas dos Cenários 2 e 4 | Saturação (Lei de Little) e comparação peso × round robin |
+
+### I. Repositório
 
 | # | Onde | O que mostrar |
 |---|------|---------------|
-| 41 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/`, `exporters/`, `prometheus/`, `grafana/` e o `docker-compose.yml` |
+| 46 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/`, `exporters/`, `prometheus/`, `grafana/` e o `docker-compose.yml` |
 
 ---
 
@@ -1208,6 +1461,18 @@ Contadores (`*_total`, `accepted`, `handled`) só crescem desde que o serviço l
 **Por que o painel de rede filtra `device="enp0s8"`?**
 É a placa host-only, por onde passa todo o tráfego do projeto (balanceamento e coleta). A placa NAT só carrega atualizações do sistema e o loopback é interno.
 
+**Por que a vazão parou em ~53 req/s no Cenário 2?**
+Cada requisição em `/carga?n=50000` gasta ~40 ms de CPU, e cada backend tem 1 vCPU: ~26 req/s por backend, ~53 no total. Com a CPU em ~98%, mais clientes só aumentam a fila e a latência.
+
+**Por que o cliente não viu erro quando o A caiu?**
+Com `proxy_next_upstream error timeout ...`, o `lb` reenviou a mesma requisição ao B ao receber *Connection refused*. Com `max_fails=1 fail_timeout=10s`, o A ficou 10 s fora da rotação após cada falha.
+
+**Por que o peso piorou o desempenho?**
+A e B são idênticos. Mandando 75% para o A, ele saturou enquanto o B ficou ocioso; a vazão total passou a ser limitada pela capacidade de um único servidor. Peso só faz sentido para servidores com capacidades diferentes.
+
+**De onde vem a latência, se o `stub_status` não a fornece?**
+Do gerador de carga (`hey`), que mede o tempo de cada requisição do ponto de vista do cliente.
+
 **Como vocês provam que a porta 5000 não é acessível?**
 `ss` mostra que ela escuta só em `127.0.0.1`, e o `curl` de fora (PC ou outra VM) falha por timeout, porque o firewall descarta o pacote.
 
@@ -1230,17 +1495,40 @@ Contadores (`*_total`, `accepted`, `handled`) só crescem desde que o serviço l
 | `curl: Protocol "htt" not supported` / `Bad hostname` | Erro de digitação (`htt://`, `=i` em vez de `-i`) | Conferir o comando; usar ↑ para editar o anterior |
 | `node_load1` do `srv-b` em ~2,5 com CPU ~10% | Atividade passageira após o boot (checagem de atualizações). `top`, `ps` (estado D) e `unattended-upgrades` não mostraram nada preso; a carga caiu sozinha (2,05 → 1,75 → 0,90). `nproc` e `free -m` confirmaram hardware idêntico em A e B | Esperar estabilizar antes dos experimentos |
 | Legendas cortadas nos painéis | Painéis baixos demais para a legenda em tabela | Altura maior nos painéis (JSON v2) |
+| `yay -S hey-bin` falhou (erro 403) | Pacote do AUR aponta para um endereço de download que não existe mais | Usar o `hey` pela imagem Docker `williamyeh/hey` |
+| `hey: -n cannot be less than -c` | Concorrência padrão do `hey` é 50 | Informar `-c` junto: `hey -n 20 -c 5 ...` |
+| Horários dos logs das VMs não batem com o PC | Relógios das VMs ~3–4 min atrasados, sem NTP | Correlacionar pelos gráficos (horário do Prometheus); melhoria: `timedatectl set-ntp true` |
 | Respostas do `for` grudadas numa linha só | `\;` antes do `echo`: a barra fez o `;` virar texto | `;` sem barra, ou filtrar com `grep -o` (uma resposta por linha) |
 
 ---
 
-## Próximas etapas
+## Entrega: checklist do enunciado
+
+| Item exigido | Onde está |
+|--------------|-----------|
+| Ambiente completo e funcional | Etapas 1 a 9 |
+| Arquivos de configuração dos três Nginx | `nginx/backend.conf` (A e B) e `nginx/lb.conf` |
+| `prometheus.yml` | `prometheus/prometheus.yml` |
+| Configurações dos exporters | `exporters/prometheus-nginx-exporter` (Node Exporter usa o padrão do pacote) |
+| Docker Compose | `docker-compose.yml` |
+| Código-fonte da aplicação e instruções | `app/app.py`, `app/app.service` e Etapa 4 |
+| Dashboards do Grafana em JSON | `grafana/dashboards/infraestrutura.json` e `grafana/dashboards/nginx.json` |
+| Prints: seis alvos UP | `docs/prints/prom-targets.png`, `prom-query-up.png` |
+| Prints: distribuição das respostas | `docs/prints/lb-round-robin-limpo.png`, `exp1-nginx.png` |
+| Prints: testes de carga | `docs/prints/exp1-*`, `exp2-*`, `exp4-*` |
+| Prints: falha de um backend | `docs/prints/exp3-*` |
+| Ferramenta, duração e concorrência dos testes | Etapa 10, tabela "Resumo dos cenários" |
+| Explicar 3 consultas PromQL | Etapa 9, seção 9.6 |
+| Arquitetura, decisões, dificuldades, resultados, limitações e melhorias | Seções de Arquitetura, Decisões técnicas, Dificuldades e Análise |
+
+### Status
 
 - [x] VMs, rede, hostname, SSH e firewall
 - [x] Aplicação em A e B (somente loopback)
-- [x] Nginx em `srv-a` e `srv-b` como proxy reverso para `127.0.0.1:5000` + `stub_status`
-- [x] Nginx balanceador no `lb` (upstream round robin) + `stub_status`
-- [x] Node Exporter e Nginx Prometheus Exporter nas três VMs (acesso restrito ao PC)
-- [x] Prometheus no PC: 6 alvos UP com rótulos
+- [x] Nginx em `srv-a` e `srv-b` (proxy reverso + `stub_status`)
+- [x] Nginx balanceador no `lb` (round robin + `stub_status`)
+- [x] Node Exporter e Nginx Exporter nas três VMs (acesso restrito ao PC)
+- [x] Prometheus: 6 alvos UP com rótulos
 - [x] Grafana: dashboards de infraestrutura e de Nginx/HTTP
-- [ ] Experimentos: carga normal, aumento de carga, falha de backend, estratégia alternativa
+- [x] Experimentos: normal, aumento de carga, falha de backend, estratégia alternativa
+- [ ] Ensaiar a demonstração com todos os integrantes
