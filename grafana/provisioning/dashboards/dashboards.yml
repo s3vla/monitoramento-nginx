@@ -1,0 +1,9 @@
+# Carrega automaticamente os dashboards JSON da pasta grafana/dashboards do repositório
+apiVersion: 1
+providers:
+  - name: monitoramento-nginx
+    folder: Monitoramento Nginx
+    type: file
+    allowUiUpdates: true         # permite editar pela interface (exportar o JSON depois)
+    options:
+      path: /var/lib/grafana/dashboards

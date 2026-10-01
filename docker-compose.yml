@@ -25,7 +25,9 @@ services:
     container_name: grafana
     network_mode: host                                   # Grafana em http://localhost:3000
     volumes:
-      - grafana-data:/var/lib/grafana                    # dashboards e usuários sobrevivem a reinícios
+      - grafana-data:/var/lib/grafana                    # usuários e preferências sobrevivem a reinícios
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro   # fonte de dados e carregador de dashboards
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro    # os dashboards JSON do repositório
     depends_on:
       - prometheus
     restart: unless-stopped

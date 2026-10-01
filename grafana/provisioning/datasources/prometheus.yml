@@ -1,0 +1,11 @@
+# Fonte de dados cadastrada automaticamente quando o Grafana sobe
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus              # identificador fixo, usado pelos dashboards
+    type: prometheus
+    access: proxy                # o servidor do Grafana consulta o Prometheus (não o navegador)
+    url: http://localhost:9090   # network_mode: host → Prometheus está no localhost do PC
+    isDefault: true
+    jsonData:
+      timeInterval: 5s           # igual ao scrape_interval do Prometheus

@@ -15,10 +15,11 @@ Ambiente distribuído com **balanceamento de carga** (Nginx) entre dois servidor
 9. [Etapa 6 — Nginx balanceador no lb](#etapa-6--nginx-balanceador-no-lb)
 10. [Etapa 7 — Exporters nas três VMs](#etapa-7--exporters-nas-três-vms)
 11. [Etapa 8 — Prometheus no PC](#etapa-8--prometheus-no-pc)
-12. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
-13. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
-14. [Dificuldades e soluções](#dificuldades-e-soluções)
-15. [Próximas etapas](#próximas-etapas)
+12. [Etapa 9 — Grafana e dashboards](#etapa-9--grafana-e-dashboards)
+13. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
+14. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
+15. [Dificuldades e soluções](#dificuldades-e-soluções)
+16. [Próximas etapas](#próximas-etapas)
 
 ---
 
@@ -50,10 +51,12 @@ Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `
 
 | VM  | Hostname | Papel             | IP host-only  | vCPU | RAM     | Disco |
 |-----|----------|-------------------|---------------|------|---------|-------|
-| VM1 | `lb`     | Nginx balanceador | 192.168.56.10 | 1    | 1024 MB | 10 GB |
-| VM2 | `srv-a`  | Servidor A        | 192.168.56.11 | 1    | 1024 MB | 10 GB |
-| VM3 | `srv-b`  | Servidor B        | 192.168.56.12 | 1    | 1024 MB | 10 GB |
+| VM1 | `lb`     | Nginx balanceador | 192.168.56.10 | 1    | 1642 MiB* | 10 GB |
+| VM2 | `srv-a`  | Servidor A        | 192.168.56.11 | 1    | 1642 MiB* | 10 GB |
+| VM3 | `srv-b`  | Servidor B        | 192.168.56.12 | 1    | 1642 MiB* | 10 GB |
 | PC  | —        | Host (Prometheus, Grafana, carga) | 192.168.56.1 | — | — | — |
+
+\* Memória total vista pelo sistema (`free -m`), idêntica nas três VMs. O valor configurado no VirtualBox (*Settings → System → Base Memory*) é um pouco maior, porque o kernel reserva uma parte. `srv-a` e `srv-b` têm exatamente o mesmo hardware (1 vCPU, mesma RAM), o que garante uma comparação justa do balanceamento.
 
 ### Rede de cada VM
 
@@ -104,6 +107,13 @@ monitoramento-nginx/
 ├── docker-compose.yml   # sobe Prometheus e Grafana no PC
 ├── prometheus/
 │   └── prometheus.yml   # os 6 alvos e os rótulos
+├── grafana/
+│   ├── provisioning/
+│   │   ├── datasources/prometheus.yml   # fonte de dados cadastrada automaticamente
+│   │   └── dashboards/dashboards.yml    # carrega os JSON da pasta dashboards/
+│   └── dashboards/
+│       ├── infraestrutura.json          # dashboard 1 (exportação JSON exigida)
+│       └── nginx.json                   # dashboard 2 (exportação JSON exigida)
 ├── lb/netplan.yaml      # rede da VM1
 ├── srv-a/netplan.yaml   # rede da VM2
 ├── srv-b/netplan.yaml   # rede da VM3
@@ -152,7 +162,7 @@ Cada passo começa dizendo **onde** o comando é executado:
 | Nome | `lb` |
 | ISO | Ubuntu Server 26.04.1 LTS |
 | OS Version | detectado pela ISO (na dúvida: *Ubuntu (64-bit)*) |
-| Memória / CPU / Disco | 1024 MB / 1 vCPU / 10 GB |
+| Memória / CPU / Disco | mesma RAM nas três VMs (ver tabela de Ambiente) / 1 vCPU / 10 GB |
 
 *Settings → Network*:
 - **Adapter 1:** NAT
@@ -880,6 +890,151 @@ git push
 
 ---
 
+## Etapa 9 — Grafana e dashboards
+
+O Grafana (já subido pelo `docker-compose.yml`) consulta o Prometheus e mostra as métricas em **dois dashboards separados**, como exige o enunciado:
+
+| Dashboard | Fonte | Painéis |
+|-----------|-------|---------|
+| **Infraestrutura das VMs** | Node Exporter | Estado dos 6 alvos, CPU, memória, rede, carga (`node_load1`), disco |
+| **Nginx e tráfego HTTP** | Nginx Exporter | `nginx_up`, taxa de requisições, A × B, distribuição, conexões ativas, aceitas × processadas, leitura/escrita/espera |
+
+### Provisionamento: tudo como código
+
+Em vez de configurar o Grafana clicando, a fonte de dados e os dashboards ficam em arquivos no repositório e são **carregados automaticamente** quando o container sobe:
+
+| Arquivo | Para quê |
+|---------|----------|
+| `grafana/provisioning/datasources/prometheus.yml` | Cadastra o Prometheus (`http://localhost:9090`) como fonte de dados padrão |
+| `grafana/provisioning/dashboards/dashboards.yml` | Manda o Grafana ler os JSON da pasta `grafana/dashboards/` |
+| `grafana/dashboards/*.json` | Os dois dashboards. São também a **exportação em JSON** pedida na entrega |
+
+No `docker-compose.yml`, o serviço `grafana` monta essas pastas:
+```yaml
+volumes:
+  - ./grafana/provisioning:/etc/grafana/provisioning:ro
+  - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+```
+
+**Vantagem:** qualquer integrante sobe o Grafana já configurado, com um comando. Se os dashboards forem editados pela interface, exportar de novo em *Share → Export → Save to file* e substituir o JSON na pasta.
+
+### 9.1 Subir e acessar
+
+🖥️ **PC** (na pasta do repositório)
+```bash
+docker compose up -d
+```
+🖥️ **PC** → navegador: **http://localhost:3000** → usuário `admin`, senha `admin` (pede para trocar no primeiro acesso) → *Dashboards → Monitoramento Nginx*
+
+![Pasta com os dois dashboards](docs/prints/graf-pasta.png)
+
+### 9.2 Dashboard de infraestrutura
+
+![Infraestrutura sem tráfego](docs/prints/graf-infra-base.png)
+![Disco](docs/prints/graf-infra-disco.png)
+
+| Painel | Consulta PromQL | Unidade |
+|--------|-----------------|---------|
+| Estado dos 6 alvos | `up` | UP/DOWN |
+| Uso de CPU | `100 * (1 - avg by (vm) (rate(node_cpu_seconds_total{mode="idle"}[1m])))` | % |
+| Memória utilizada | `100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)` | % |
+| Tráfego de rede | `rate(node_network_receive_bytes_total{device="enp0s8"}[1m])` e `..._transmit_...` | B/s |
+| Carga média | `node_load1` | — |
+| Disco raiz | `node_filesystem_size_bytes{mountpoint="/"}` e `node_filesystem_avail_bytes{mountpoint="/"}` | bytes |
+
+### 9.3 Dashboard de Nginx e tráfego HTTP
+
+![Nginx sem tráfego](docs/prints/graf-nginx-base.png)
+
+| Painel | Consulta PromQL | Unidade |
+|--------|-----------------|---------|
+| Estado de cada Nginx | `nginx_up` | UP/DOWN |
+| Taxa de requisições | `rate(nginx_http_requests_total[1m])` | req/s |
+| Round robin A × B (mesmo painel) | `rate(nginx_http_requests_total{vm=~"srv-a\|srv-b"}[1m])` | req/s |
+| Distribuição no período | `round(sum by (vm) (increase(nginx_http_requests_total{vm=~"srv-a\|srv-b"}[$__range])))` | requisições |
+| Conexões ativas | `nginx_connections_active` | — |
+| Aceitas × processadas | `rate(nginx_connections_accepted[1m])` e `rate(nginx_connections_handled[1m])` | conexões/s |
+| Leitura / escrita / espera | `nginx_connections_reading`, `..._writing`, `..._waiting` | — |
+
+### Padrões adotados em todos os painéis
+
+- **Título, unidade, legenda e intervalo:** cada painel tem título descritivo, unidade (%, B/s, req/s...) e legenda em tabela com média, máximo e último valor. Intervalo padrão: últimos 15 min, atualização a cada 5 s.
+- **Contadores com `rate`:** métricas que só crescem (`*_total`, `accepted`, `handled`) são transformadas em taxa por segundo; métricas instantâneas (`node_load1`, `nginx_connections_active`) são usadas direto.
+- **Cores fixas por VM:** `lb` cinza, `srv-a` azul, `srv-b` laranja, em todos os painéis.
+- **Descrição em cada painel** (ícone ⓘ ao lado do título) explicando a consulta.
+
+### 9.4 Linha de base (sem tráfego)
+
+Mesmo sem ninguém acessando, os gráficos não ficam zerados:
+
+| O que aparece | Por quê |
+|---------------|---------|
+| **0,2 req/s** em cada Nginx | O próprio monitoramento: o exporter lê o `stub_status` a cada 5 s, e cada leitura é uma requisição (1 ÷ 5 s = 0,2 req/s) |
+| ~4,8 kB/s transmitidos por VM | Os exporters respondendo às coletas do Prometheus |
+| CPU ~10%, memória ~24% | Consumo do sistema, do Nginx, da aplicação e dos exporters parados |
+
+Essa é a **linha de base** contra a qual os experimentos são comparados.
+
+### 9.5 Com tráfego
+
+🖥️ **PC**
+```bash
+for i in $(seq 200); do curl -s http://192.168.56.10/ > /dev/null; done
+```
+
+![Nginx com tráfego](docs/prints/graf-nginx-trafego.png)
+![Infraestrutura com tráfego](docs/prints/graf-infra-trafego.png)
+
+| Nginx | Taxa | Leitura |
+|-------|------|---------|
+| `lb`    | 3,84 req/s | Todo o tráfego entra por ele (≈3,64) + 0,2 do exporter |
+| `srv-a` | 2,02 req/s | Metade (≈1,82) + 0,2 do exporter |
+| `srv-b` | 2,02 req/s | A outra metade (≈1,82) + 0,2 do exporter |
+
+- **Distribuição: 239 × 240 requisições (50% / 50%).** Round robin praticamente perfeito.
+- **Conexões aceitas:** `lb` 3,64 c/s; A e B 1,82 c/s cada. Cada `curl` abre uma conexão nova, e o `lb` abre uma nova conexão com o backend a cada requisição; por isso a taxa de conexões acompanha a de requisições.
+- **Rede:** o `lb` recebe ~4,3 kB/s e cada backend ~1,2 kB/s; o tráfego se divide depois do balanceador.
+
+### 9.6 Três consultas PromQL explicadas
+
+O enunciado pede que o grupo saiba explicar a consulta de pelo menos três painéis.
+
+**1. Uso de CPU (%)**
+```promql
+100 * (1 - avg by (vm) (rate(node_cpu_seconds_total{mode="idle"}[1m])))
+```
+- `node_cpu_seconds_total{mode="idle"}`: contador de segundos que cada núcleo passou **ocioso** desde o boot.
+- `rate(...[1m])`: quantos segundos ocioso **por segundo**, no último minuto. Dá um valor entre 0 e 1 (0,9 = 90% do tempo parado).
+- `avg by (vm)`: média dos núcleos de cada VM (aqui, 1 núcleo por VM), mantendo uma linha por VM.
+- `1 - ...`: inverte de ocioso para **ocupado**. `100 *`: em porcentagem.
+
+**2. Taxa de requisições por Nginx**
+```promql
+rate(nginx_http_requests_total[1m])
+```
+- `nginx_http_requests_total`: contador de requisições desde que o Nginx ligou; só cresce, então o valor bruto não diz nada sobre "agora".
+- `rate(...[1m])`: diferença do contador no último minuto dividida pelo tempo = **requisições por segundo**.
+- No painel A × B, o filtro `{vm=~"srv-a|srv-b"}` (`=~` = expressão regular) deixa só os backends, para comparar o round robin.
+
+**3. Memória utilizada (%)**
+```promql
+100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+```
+- `MemAvailable`: memória que ainda pode ser usada sem recorrer a swap (inclui cache que pode ser liberado). `MemTotal`: memória total.
+- `disponível / total`: fração livre. `1 - ...`: fração usada. `100 *`: porcentagem.
+- São *gauges* (valores instantâneos), por isso não precisam de `rate`.
+
+### 9.7 Versionar
+
+🖥️ **PC**
+```bash
+git add .
+git commit -m "feat: Grafana com dashboards provisionados"
+git push
+```
+
+---
+
 ## Roteiro de demonstração ao professor
 
 Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**.
@@ -948,11 +1103,22 @@ Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**
 | 33 | 🖥️ PC (navegador) | consulta `up` | 6 séries com valor 1 |
 | 34 | 🖥️ PC (navegador) | consulta `up{vm="srv-a"}` | Os rótulos filtram uma VM específica |
 
-### G. Repositório
+### G. Grafana
+
+| # | Onde rodar | Ação | Mostrar / explicar |
+|---|------------|------|--------------------|
+| 35 | 🖥️ PC | `ls grafana/provisioning grafana/dashboards` | Fonte de dados e dashboards como código, carregados automaticamente |
+| 36 | 🖥️ PC (navegador) | Dashboard *Infraestrutura das VMs* | Seção de infraestrutura: alvos, CPU, memória, rede, carga, disco |
+| 37 | 🖥️ PC (navegador) | Dashboard *Nginx e tráfego HTTP* | Seção HTTP: requisições, A × B, conexões |
+| 38 | 🖥️ PC | `for i in $(seq 200); do curl -s http://192.168.56.10/ > /dev/null; done` | Ao vivo: a taxa sobe e A e B ficam sobrepostos; a pizza fica em 50/50 |
+| 39 | 🖥️ PC (navegador) | Ícone ⓘ / *Edit* nos painéis de CPU, requisições e memória | Explicar as 3 consultas PromQL (seção 9.6) |
+| 40 | 🖥️ PC (navegador) | Painel de requisições sem tráfego | Linha de base de 0,2 req/s = o próprio exporter |
+
+### H. Repositório
 
 | # | Onde | O que mostrar |
 |---|------|---------------|
-| 35 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/`, `exporters/`, `prometheus/` e o `docker-compose.yml` |
+| 41 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/`, `exporters/`, `prometheus/`, `grafana/` e o `docker-compose.yml` |
 
 ---
 
@@ -967,7 +1133,7 @@ Os IPs vão no `upstream` do Nginx e no `prometheus.yml`. Se mudassem (DHCP), es
 **Por que a host-only não tem gateway no netplan?**
 Uma máquina deve ter uma única rota padrão. Ela já vem pela NAT (DHCP), que é a única com saída para a internet.
 
-**Por que 1 vCPU e 1 GB?**
+**Por que 1 vCPU e pouca memória?**
 Suficiente para Nginx, aplicação e exporters. Com 1 vCPU, a rota de carga satura a CPU rapidamente e o efeito fica visível nos gráficos. `srv-a` e `srv-b` são idênticas para a comparação do balanceamento ser justa.
 
 **Por que Ubuntu Server sem interface gráfica?**
@@ -1030,6 +1196,18 @@ O padrão (1 min) é lento para testes de carga de poucos minutos. Com 5 s, as m
 **O que é a métrica `up`?**
 É criada pelo próprio Prometheus para cada alvo: 1 se a última coleta funcionou, 0 se falhou. É a base do painel de estado dos alvos.
 
+**Por que provisionar o Grafana por arquivos, e não pela interface?**
+Reprodutibilidade: a fonte de dados e os dashboards ficam no repositório e são carregados ao subir o container. Os próprios arquivos JSON são a exportação exigida na entrega.
+
+**Por que usar `rate` em alguns painéis e não em outros?**
+Contadores (`*_total`, `accepted`, `handled`) só crescem desde que o serviço ligou; o valor bruto não mostra o que acontece agora. `rate` calcula a variação por segundo. Gauges (`node_load1`, `nginx_connections_active`, memória) já são o valor do momento e são usados direto.
+
+**Por que aparecem 0,2 req/s sem ninguém acessando?**
+É o próprio monitoramento: o exporter lê o `stub_status` a cada 5 s, e cada leitura conta como uma requisição no Nginx (1 ÷ 5 = 0,2 req/s).
+
+**Por que o painel de rede filtra `device="enp0s8"`?**
+É a placa host-only, por onde passa todo o tráfego do projeto (balanceamento e coleta). A placa NAT só carrega atualizações do sistema e o loopback é interno.
+
 **Como vocês provam que a porta 5000 não é acessível?**
 `ss` mostra que ela escuta só em `127.0.0.1`, e o `curl` de fora (PC ou outra VM) falha por timeout, porque o firewall descarta o pacote.
 
@@ -1050,6 +1228,8 @@ O padrão (1 min) é lento para testes de carga de poucos minutos. Com 5 s, as m
 | `curl` sem resposta logo após o `restart` | A aplicação ainda estava subindo | `systemctl status app` e `curl -v` |
 | `ufw: ERROR: Wrong number of arguments` | Faltou o número da porta na regra | `sudo ufw allow from 192.168.56.10 to any port 80 proto tcp` |
 | `curl: Protocol "htt" not supported` / `Bad hostname` | Erro de digitação (`htt://`, `=i` em vez de `-i`) | Conferir o comando; usar ↑ para editar o anterior |
+| `node_load1` do `srv-b` em ~2,5 com CPU ~10% | Atividade passageira após o boot (checagem de atualizações). `top`, `ps` (estado D) e `unattended-upgrades` não mostraram nada preso; a carga caiu sozinha (2,05 → 1,75 → 0,90). `nproc` e `free -m` confirmaram hardware idêntico em A e B | Esperar estabilizar antes dos experimentos |
+| Legendas cortadas nos painéis | Painéis baixos demais para a legenda em tabela | Altura maior nos painéis (JSON v2) |
 | Respostas do `for` grudadas numa linha só | `\;` antes do `echo`: a barra fez o `;` virar texto | `;` sem barra, ou filtrar com `grep -o` (uma resposta por linha) |
 
 ---
@@ -1062,5 +1242,5 @@ O padrão (1 min) é lento para testes de carga de poucos minutos. Com 5 s, as m
 - [x] Nginx balanceador no `lb` (upstream round robin) + `stub_status`
 - [x] Node Exporter e Nginx Prometheus Exporter nas três VMs (acesso restrito ao PC)
 - [x] Prometheus no PC: 6 alvos UP com rótulos
-- [ ] Grafana: dashboards de infraestrutura e de Nginx/HTTP
+- [x] Grafana: dashboards de infraestrutura e de Nginx/HTTP
 - [ ] Experimentos: carga normal, aumento de carga, falha de backend, estratégia alternativa
