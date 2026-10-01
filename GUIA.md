@@ -83,6 +83,26 @@ sudo ufw enable              # ativa (bloqueia tudo que não foi liberado)
 sudo ufw status verbose      # mostra regras ativas
 sudo ufw allow from IP to any port N proto tcp   # libera porta só para um IP de origem
 ```
+**Lendo o `ufw status verbose`:**
+- `deny (incoming)`: tudo que chega é bloqueado, exceto as regras listadas.
+- `allow (outgoing)`: a VM pode sair (apt, ping).
+- `disabled (routed)`: a VM não repassa tráfego entre redes (não é roteador).
+- `ALLOW IN ... Anywhere`: aceita dessa porta vindo de qualquer IP. Para restringir, use `from IP`.
+- Aviso "may disrupt existing ssh connections": só derruba se o SSH não estiver liberado.
+
+## Lendo saídas de verificação
+
+**`hostnamectl`:** `Static hostname` (nome definido), `Operating System` (versão para o README), `Machine ID` (identificador único da instalação; clones herdam o mesmo e precisam regenerar).
+
+**`ip -4 addr show enp0s8`:**
+- `state UP`: interface ligada.
+- `inet 192.168.56.10/24`: IP e máscara.
+- `valid_lft forever`: IP estático. Com DHCP apareceria um tempo em segundos (prazo do empréstimo).
+
+**`scp`:** a barra `100%` e o tamanho em bytes confirmam a cópia. Pede a senha da VM porque usa SSH.
+
+**`git commit`:** `[main 085978c]` = branch e ID curto do commit · `create mode 100644` = arquivo novo com permissão normal.
+**`git push`:** `ee06e3e..085978c main -> main` = o remoto avançou do commit antigo para o novo.
 
 ## VirtualBox — problemas comuns
 
