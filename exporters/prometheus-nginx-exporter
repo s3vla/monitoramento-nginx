@@ -1,0 +1,7 @@
+# Configuração do Nginx Prometheus Exporter (igual nas três VMs)
+# Instalar em /etc/default/prometheus-nginx-exporter
+#
+# --nginx.scrape-uri    : onde o exporter lê o stub_status do Nginx local
+#                         (o padrão do pacote é /stub_status; o nosso endpoint é /nginx_status)
+# --web.listen-address  : porta em que o exporter publica as métricas para o Prometheus
+ARGS="--nginx.scrape-uri=http://127.0.0.1:8080/nginx_status --web.listen-address=:9113"

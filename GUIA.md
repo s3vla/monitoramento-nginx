@@ -176,7 +176,56 @@ sudo ufw delete N                                             # apaga a regra N
 ```
 Ordem obrigatória: `from IP` → `to any` → `port N` → `proto tcp`. Faltando a porta: "Wrong number of arguments".
 
+**Balanceamento (`upstream`):**
+```nginx
+upstream grupo {                 # nome do grupo, usado no proxy_pass
+    server IP1:80;               # sem algoritmo = round robin (alterna um a um)
+    server IP2:80 weight=2;      # weight: recebe o dobro (cenário 4)
+    # least_conn;                # alternativa: manda para quem tem menos conexões abertas
+}
+location / { proxy_pass http://grupo; }
+```
+- `max_fails=N fail_timeout=Ts`: após N falhas, o servidor fica T segundos fora da rotação.
+- `proxy_next_upstream error timeout ...`: em caso de falha, reenvia a requisição ao próximo servidor.
+- `proxy_connect_timeout 2s`: tempo máximo para conectar ao backend (padrão 60 s).
+- `$upstream_addr`: variável com o backend escolhido (útil em cabeçalho ou log).
+
+**Repetir um comando N vezes (bash):**
+```bash
+for i in $(seq 6); do COMANDO; done      # $(seq 6) gera 1 2 3 4 5 6; ";" separa os comandos
+```
+`grep -o 'padrão'` mostra só o trecho que casa com o padrão, um por linha. Uma `\` antes do `;` o transforma em texto (o loop quebra).
+
 **Dica de terminal:** ↑ traz o comando anterior para corrigir só o erro de digitação, em vez de redigitar.
+
+## Exporters e métricas
+
+**Exporter:** programa que traduz o estado de algo (máquina, Nginx) para métricas no formato do Prometheus, publicadas em `http://IP:PORTA/metrics`. O Prometheus **busca** (pull) periodicamente; o exporter não envia nada sozinho.
+
+| Exporter | Porta | Pacote Ubuntu |
+|----------|-------|---------------|
+| Node Exporter | 9100 | `prometheus-node-exporter` |
+| Nginx Prometheus Exporter | 9113 | `prometheus-nginx-exporter` |
+
+```bash
+curl -s http://127.0.0.1:9100/metrics | grep "^node_load"   # filtra as linhas que COMEÇAM com node_load
+curl -s http://127.0.0.1:9113/metrics | grep "^nginx_"      # todas as métricas do Nginx
+```
+`curl -s` = silencioso (sem barra de progresso, bom com `|`). `^` no grep = início da linha (ignora os comentários `# HELP` / `# TYPE`).
+
+**Formato de uma métrica:**
+```
+nome{rotulo="valor"} 123.4
+node_cpu_seconds_total{cpu="0",mode="idle"} 5021.3
+```
+- **Gauge:** valor que sobe e desce (`node_load1`, `nginx_connections_active`). Usa-se direto.
+- **Counter:** só cresce desde que o serviço ligou (`*_total`, `nginx_connections_accepted`). Usa-se com `rate()` ou `increase()` para ver taxa.
+
+**`/etc/default/<serviço>`:** parâmetros de serviços instalados por pacote. O systemd lê `ARGS="..."` e passa ao programa. Depois de editar: `sudo systemctl restart <serviço>`.
+
+**`nginx_up`:** 1 = exporter leu o `stub_status`; 0 = não conseguiu (caminho errado ou Nginx parado).
+
+**ufw com várias portas:** `sudo ufw allow from IP to any port 9100,9113 proto tcp` (lista com vírgula exige `proto`).
 
 ## Clonar VMs
 

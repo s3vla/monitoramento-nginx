@@ -13,10 +13,11 @@ Ambiente distribuído com **balanceamento de carga** (Nginx) entre dois servidor
 7. [Etapa 4 — Aplicação nos servidores A e B](#etapa-4--aplicação-nos-servidores-a-e-b)
 8. [Etapa 5 — Nginx nos servidores A e B](#etapa-5--nginx-nos-servidores-a-e-b)
 9. [Etapa 6 — Nginx balanceador no lb](#etapa-6--nginx-balanceador-no-lb)
-10. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
-11. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
-12. [Dificuldades e soluções](#dificuldades-e-soluções)
-13. [Próximas etapas](#próximas-etapas)
+10. [Etapa 7 — Exporters nas três VMs](#etapa-7--exporters-nas-três-vms)
+11. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
+12. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
+13. [Dificuldades e soluções](#dificuldades-e-soluções)
+14. [Próximas etapas](#próximas-etapas)
 
 ---
 
@@ -70,6 +71,8 @@ Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `
 | Nginx (site) | srv-a, srv-b | `0.0.0.0:80`   | Somente o `lb` (192.168.56.10), pelo firewall |
 | Nginx `stub_status` | srv-a, srv-b | `127.0.0.1:8080` | Somente a própria VM (exporter local) |
 | Aplicação | srv-a, srv-b | `127.0.0.1:5000` | Somente a própria VM (Nginx local) |
+| Node Exporter | todas as VMs | `*:9100` | Somente o PC (Prometheus), pelo firewall |
+| Nginx Prometheus Exporter | todas as VMs | `*:9113` | Somente o PC (Prometheus), pelo firewall |
 
 ### Versões
 
@@ -80,6 +83,8 @@ Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `
 | Kernel        | 7.0.0-34-generic |
 | Nginx         | 1.28.3 (Open Source) |
 | Python        | 3.14.4 |
+| Node Exporter | pacote `prometheus-node-exporter` do Ubuntu |
+| Nginx Prometheus Exporter | pacote `prometheus-nginx-exporter` do Ubuntu |
 | curl          | 8.18.0 |
 | Usuário admin | `ram` |
 
@@ -98,6 +103,8 @@ monitoramento-nginx/
 ├── nginx/
 │   ├── backend.conf     # Nginx dos servidores A e B (proxy reverso + stub_status)
 │   └── lb.conf          # Nginx balanceador (upstream round robin + stub_status)
+├── exporters/
+│   └── prometheus-nginx-exporter   # configuração do Nginx Exporter (igual nas 3 VMs)
 └── docs/prints/         # evidências (capturas de tela)
 ```
 
@@ -650,6 +657,121 @@ git push
 
 ---
 
+## Etapa 7 — Exporters nas três VMs
+
+O Prometheus não entra nas VMs: ele **pergunta** periodicamente a cada exporter, por HTTP, e o exporter responde com as métricas em texto. São dois exporters por VM, totalizando os **6 alvos** que o Prometheus vai coletar.
+
+```
+                      ┌─ :9100  Node Exporter  ──► CPU, memória, disco, carga, rede
+PC (Prometheus) ──────┤
+                      └─ :9113  Nginx Exporter ──► lê 127.0.0.1:8080/nginx_status
+                                                   e converte em métricas nginx_*
+```
+
+| Exporter | Porta | Lê de | Métricas usadas no projeto |
+|----------|-------|-------|----------------------------|
+| Node Exporter | 9100 | O próprio Linux (`/proc`, `/sys`) | `node_cpu_seconds_total`, `node_memory_*`, `node_network_*`, `node_filesystem_*`, `node_load1` |
+| Nginx Prometheus Exporter | 9113 | `stub_status` do Nginx local | `nginx_up`, `nginx_http_requests_total`, `nginx_connections_*` |
+
+**Por que o Nginx Exporter existe:** o `stub_status` mostra um texto simples, que o Prometheus não entende. O exporter lê esse texto e o converte para o formato do Prometheus.
+
+### A configuração
+
+Os dois exporters vêm como **pacotes do Ubuntu** e já sobem como serviço systemd. O Node Exporter funciona sem configuração. O Nginx Exporter precisa saber onde está o status, porque o padrão do pacote é `/stub_status` e o nosso endpoint é `/nginx_status`:
+
+`exporters/prometheus-nginx-exporter` → `/etc/default/prometheus-nginx-exporter`
+```bash
+ARGS="--nginx.scrape-uri=http://127.0.0.1:8080/nginx_status --web.listen-address=:9113"
+```
+| Opção | Para quê |
+|-------|----------|
+| `--nginx.scrape-uri` | Endereço do `stub_status` local que o exporter lê |
+| `--web.listen-address=:9113` | Porta em que o exporter publica as métricas |
+
+O arquivo `/etc/default/<serviço>` é onde o Ubuntu guarda os parâmetros dos serviços instalados por pacote: o systemd lê a variável `ARGS` e a passa ao programa.
+
+### 7.1 Enviar o arquivo para as três VMs
+
+🖥️ **PC**
+```bash
+mkdir -p exporters
+mv ~/Downloads/prometheus-nginx-exporter exporters/
+for ip in 10 11 12; do scp exporters/prometheus-nginx-exporter ram@192.168.56.$ip:~/; done
+```
+
+### 7.2 Instalar
+
+📦 **VM `lb`**, 📦 **VM `srv-a`** e 📦 **VM `srv-b`** (comandos idênticos nas três)
+```bash
+sudo apt install -y prometheus-node-exporter prometheus-nginx-exporter
+sudo mv ~/prometheus-nginx-exporter /etc/default/prometheus-nginx-exporter
+sudo systemctl restart prometheus-nginx-exporter                     # relê o ARGS novo
+sudo ufw allow from 192.168.56.1 to any port 9100,9113 proto tcp     # exporters só para o PC
+```
+
+### 7.3 Testar dentro de cada VM
+
+📦 **VM `lb`**, 📦 **VM `srv-a`** e 📦 **VM `srv-b`**
+```bash
+curl -s http://127.0.0.1:9100/metrics | grep "^node_load1"   # Node Exporter
+curl -s http://127.0.0.1:9113/metrics | grep "^nginx_up"     # Nginx Exporter
+ss -tlnp | grep -E ':9100|:9113'
+```
+
+![Exporters no lb](docs/prints/exp-lb-local.png)
+![Exporters no srv-a](docs/prints/exp-srv-a-local.png)
+![Exporters no srv-b](docs/prints/exp-srv-b-local.png)
+
+| Saída | Significado |
+|-------|-------------|
+| `node_load1 1.25` / `node_load15 0.17` | Carga média do último 1 min e dos últimos 15 min (alta logo após a instalação, que acabou de rodar) |
+| `nginx_up 1` | O exporter conseguiu ler o `stub_status`. **0** = não conseguiu (caminho ou porta errados, ou Nginx parado) |
+| `*:9100` e `*:9113` | Exporters escutando em todas as interfaces; o firewall limita quem acessa |
+
+O `grep "^node_load1"` também mostra `node_load15`, porque começa com o mesmo texto.
+
+### 7.4 Testar do PC (como o Prometheus vai coletar)
+
+🖥️ **PC**
+```bash
+for ip in 10 11 12; do
+  echo "== 192.168.56.$ip"
+  curl -s --max-time 3 http://192.168.56.$ip:9100/metrics | grep "^node_load1"
+  curl -s --max-time 3 http://192.168.56.$ip:9113/metrics | grep "^nginx_up"
+done
+```
+
+![Os 6 alvos acessíveis a partir do PC](docs/prints/exp-pc-6-alvos.png)
+
+As três VMs responderam nas duas portas: são os **6 alvos** (3 Node Exporter + 3 Nginx Exporter), todos com `nginx_up 1`.
+
+### 7.5 Provar que só o PC acessa os exporters
+
+📦 **VM `lb`** (uma VM qualquer tentando ler o exporter de outra)
+```bash
+curl --max-time 3 http://192.168.56.11:9100/metrics
+```
+
+![lb bloqueado no exporter do srv-a](docs/prints/exp-lb-bloqueado.png)
+
+| Origem | Porta 9100/9113 das VMs | Por quê |
+|--------|-------------------------|---------|
+| 🖥️ PC (192.168.56.1) | ✅ responde | Regra `ufw allow from 192.168.56.1 to any port 9100,9113` |
+| 📦 `lb` (192.168.56.10) | ❌ timeout | Não está na regra: o firewall descarta |
+
+Atende ao enunciado: *"Restringir o acesso às portas dos exporters ao computador que executa o Prometheus."*
+
+### 7.6 Versionar
+
+🖥️ **PC**
+```bash
+git add .
+git commit -m "feat: Node Exporter e Nginx Exporter nas três VMs"
+git push
+```
+
+---
+
 ## Roteiro de demonstração ao professor
 
 Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**.
@@ -698,11 +820,21 @@ Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**
 | 23 | 🖥️ **PC** | `curl -i http://192.168.56.10/` | `X-Upstream` (escolha do lb) e `X-Backend` (quem respondeu) |
 | 24 | 📦 VM `lb` | `curl http://127.0.0.1:8080/nginx_status` | Status do balanceador; os contadores sobem a cada requisição |
 
-### E. Repositório
+### E. Exporters
+
+| # | Onde rodar | Comando | Mostrar / explicar |
+|---|------------|---------|--------------------|
+| 25 | 📦 VM `srv-a` | `cat /etc/default/prometheus-nginx-exporter` | O exporter lê o `stub_status` local em `127.0.0.1:8080/nginx_status` |
+| 26 | 📦 VM `srv-a` | `curl -s http://127.0.0.1:9113/metrics \| grep "^nginx_"` | O texto do `stub_status` convertido em métricas `nginx_*` |
+| 27 | 🖥️ **PC** | o `for` da etapa 7.4 | Os 6 alvos respondendo |
+| 28 | 📦 VM `lb` | `curl --max-time 3 http://192.168.56.11:9100/metrics` | **Timeout**: só o PC acessa os exporters |
+| 29 | 📦 qualquer VM | `sudo ufw status` | Portas 9100 e 9113 liberadas só para `192.168.56.1` |
+
+### F. Repositório
 
 | # | Onde | O que mostrar |
 |---|------|---------------|
-| 25 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/` com as configs |
+| 30 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/`, `exporters/` com as configs |
 
 ---
 
@@ -753,6 +885,18 @@ Com `proxy_connect_timeout 2s` e `proxy_next_upstream`, o `lb` desiste do servid
 **Por que a porta 80 do lb só aceita o PC?**
 O PC é o único cliente: é dele que saem os testes e o gerador de carga. Liberar só o necessário é o princípio do firewall do projeto.
 
+**Por que dois exporters por VM?**
+Cada um mede uma coisa: o Node Exporter mede a máquina (CPU, memória, disco, rede); o Nginx Exporter mede o tráfego HTTP (requisições e conexões). Juntos, mostram o efeito da carga na infraestrutura e no serviço.
+
+**Por que o Nginx Exporter, se já existe o stub_status?**
+O `stub_status` é um texto simples que o Prometheus não sabe ler. O exporter o lê localmente e o converte para o formato de métricas do Prometheus.
+
+**Por que o stub_status fica local, mas os exporters ficam abertos à rede?**
+O `stub_status` só é lido pelo exporter da própria VM, então não precisa sair dela. Já os exporters precisam ser lidos pelo Prometheus, que roda no PC; por isso escutam na rede, com o firewall liberando apenas o IP do PC.
+
+**Por que instalar pelos pacotes do Ubuntu?**
+Já vêm com o serviço systemd configurado (sobe no boot, religa se cair) e são atualizados pelo `apt`. São as versões open source exigidas.
+
 **Como vocês provam que a porta 5000 não é acessível?**
 `ss` mostra que ela escuta só em `127.0.0.1`, e o `curl` de fora (PC ou outra VM) falha por timeout, porque o firewall descarta o pacote.
 
@@ -783,7 +927,7 @@ O PC é o único cliente: é dele que saem os testes e o gerador de carga. Liber
 - [x] Aplicação em A e B (somente loopback)
 - [x] Nginx em `srv-a` e `srv-b` como proxy reverso para `127.0.0.1:5000` + `stub_status`
 - [x] Nginx balanceador no `lb` (upstream round robin) + `stub_status`
-- [ ] Node Exporter e Nginx Prometheus Exporter nas três VMs (acesso restrito ao PC)
+- [x] Node Exporter e Nginx Prometheus Exporter nas três VMs (acesso restrito ao PC)
 - [ ] Prometheus no PC: 6 alvos UP com rótulos
 - [ ] Grafana: dashboards de infraestrutura e de Nginx/HTTP
 - [ ] Experimentos: carga normal, aumento de carga, falha de backend, estratégia alternativa
