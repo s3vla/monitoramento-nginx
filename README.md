@@ -12,10 +12,11 @@ Ambiente distribuído com **balanceamento de carga** (Nginx) entre dois servidor
 6. [Etapa 3 — Clonar a VM2 (srv-a) e a VM3 (srv-b)](#etapa-3--clonar-a-vm2-srv-a-e-a-vm3-srv-b)
 7. [Etapa 4 — Aplicação nos servidores A e B](#etapa-4--aplicação-nos-servidores-a-e-b)
 8. [Etapa 5 — Nginx nos servidores A e B](#etapa-5--nginx-nos-servidores-a-e-b)
-9. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
-10. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
-11. [Dificuldades e soluções](#dificuldades-e-soluções)
-12. [Próximas etapas](#próximas-etapas)
+9. [Etapa 6 — Nginx balanceador no lb](#etapa-6--nginx-balanceador-no-lb)
+10. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
+11. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
+12. [Dificuldades e soluções](#dificuldades-e-soluções)
+13. [Próximas etapas](#próximas-etapas)
 
 ---
 
@@ -64,6 +65,8 @@ Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `
 | Serviço   | Onde         | Escuta em        | Quem acessa |
 |-----------|--------------|------------------|-------------|
 | SSH       | todas as VMs | `0.0.0.0:22`     | PC (administração) |
+| Nginx balanceador | lb   | `0.0.0.0:80`     | Somente o PC (192.168.56.1), pelo firewall |
+| Nginx `stub_status` | lb | `127.0.0.1:8080` | Somente a própria VM (exporter local) |
 | Nginx (site) | srv-a, srv-b | `0.0.0.0:80`   | Somente o `lb` (192.168.56.10), pelo firewall |
 | Nginx `stub_status` | srv-a, srv-b | `127.0.0.1:8080` | Somente a própria VM (exporter local) |
 | Aplicação | srv-a, srv-b | `127.0.0.1:5000` | Somente a própria VM (Nginx local) |
@@ -93,7 +96,8 @@ monitoramento-nginx/
 │   ├── app.py           # aplicação dos servidores A e B
 │   └── app.service      # serviço systemd da aplicação
 ├── nginx/
-│   └── backend.conf     # Nginx dos servidores A e B (proxy reverso + stub_status)
+│   ├── backend.conf     # Nginx dos servidores A e B (proxy reverso + stub_status)
+│   └── lb.conf          # Nginx balanceador (upstream round robin + stub_status)
 └── docs/prints/         # evidências (capturas de tela)
 ```
 
@@ -554,6 +558,98 @@ git push
 
 ---
 
+## Etapa 6 — Nginx balanceador no lb
+
+O `lb` é a **porta de entrada** do ambiente: recebe todas as requisições e as distribui entre os Nginx de A e B.
+
+```
+PC ──► lb:80 ──upstream (round robin)──┬──► srv-a:80 ──► app A
+                                       └──► srv-b:80 ──► app B
+```
+
+### O arquivo de configuração
+
+`nginx/lb.conf`:
+
+| Diretiva | Para quê |
+|----------|----------|
+| `upstream backends { server 192.168.56.11:80; server 192.168.56.12:80; }` | Grupo de destinos: os **Nginx** de A e B (porta 80), nunca a aplicação (5000) |
+| *(sem algoritmo declarado)* | **Round robin**: alterna um a um, o padrão do Nginx |
+| `max_fails=1 fail_timeout=10s` | Após 1 falha, o servidor fica 10 s fora da rotação |
+| `proxy_pass http://backends;` | Envia para o grupo, não para um IP fixo |
+| `proxy_set_header ...` | Preserva Host, IP do cliente e protocolo, como nos backends |
+| `proxy_connect_timeout 2s;` | Backend fora do ar: desiste em 2 s (o padrão seria 60 s) |
+| `proxy_next_upstream error timeout http_502 http_503 http_504;` | Se um backend falhar, a mesma requisição é tentada no outro |
+| `add_header X-Upstream $upstream_addr always;` | Mostra na resposta para qual backend a requisição foi |
+| `listen 127.0.0.1:8080` + `stub_status` | Status local para o exporter do `lb` |
+
+As três últimas preparam o **cenário 3** (falha de um backend): o cliente não deve ver erro quando A ou B cair.
+
+### 6.1 Enviar o arquivo
+
+🖥️ **PC**
+```bash
+mv ~/Downloads/lb.conf nginx/
+scp nginx/lb.conf ram@192.168.56.10:~/
+```
+
+### 6.2 Instalar e ativar
+
+📦 **VM `lb`**
+```bash
+sudo apt install -y nginx
+sudo mv ~/lb.conf /etc/nginx/sites-available/lb
+sudo ln -s /etc/nginx/sites-available/lb /etc/nginx/sites-enabled/
+sudo rm /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+sudo ufw allow from 192.168.56.1 to any port 80 proto tcp    # porta 80 do lb só para o PC
+```
+
+### 6.3 Testar dentro do lb
+
+📦 **VM `lb`**
+```bash
+curl http://127.0.0.1:8080/nginx_status
+ss -tlnp | grep -E ':80|:8080'
+```
+
+![Instalação e status no lb](docs/prints/lb-nginx-instalacao.png)
+
+`nginx -t` sem erros, regra do firewall adicionada, `stub_status` respondendo e as portas `0.0.0.0:80` (entrada) e `127.0.0.1:8080` (status) escutando.
+
+### 6.4 Demonstrar o round robin
+
+🖥️ **PC**
+```bash
+for i in $(seq 6); do curl -s http://192.168.56.10/ | grep -o '"servidor": "[^"]*"'; done
+```
+Saída esperada: uma resposta por linha, alternando.
+
+![Round robin, uma resposta por linha](docs/prints/lb-round-robin-limpo.png)
+
+A sequência pode começar por A **ou** por B: o Nginx guarda a posição da rotação entre requisições, então a primeira desta rodada continua de onde a anterior parou. O que importa é a **alternância**.
+
+```bash
+curl -i http://192.168.56.10/       # cabeçalhos: X-Upstream e X-Backend
+```
+
+![Round robin com cabeçalhos](docs/prints/lb-round-robin.png)
+
+- As 6 requisições alternaram **A, B, A, B, A, B**: o round robin funcionando.
+- `X-Upstream: 192.168.56.11:80` (colocado pelo `lb`) e `X-Backend: srv-a` (colocado pelo Nginx do `srv-a`) confirmam o caminho completo: **PC → lb → srv-a**.
+
+### 6.5 Versionar
+
+🖥️ **PC**
+```bash
+git add .
+git commit -m "feat: Nginx balanceador com upstream round robin"
+git push
+```
+
+---
+
 ## Roteiro de demonstração ao professor
 
 Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**.
@@ -593,11 +689,20 @@ Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**
 | 19 | 🖥️ **PC** | `curl --max-time 3 http://192.168.56.11/` | **Timeout**: só o `lb` pode acessar os backends |
 | 20 | 📦 VM `srv-a` | `sudo ufw status` | Regra da porta 80 restrita a `192.168.56.10` |
 
-### D. Repositório
+### D. Balanceamento
+
+| # | Onde rodar | Comando | Mostrar / explicar |
+|---|------------|---------|--------------------|
+| 21 | 📦 VM `lb` | `cat /etc/nginx/sites-available/lb` | `upstream` apontando para a porta **80** dos Nginx de A e B (não para a 5000); sem algoritmo = round robin |
+| 22 | 🖥️ **PC** | `for i in $(seq 6); do curl -s http://192.168.56.10/ \| grep -o '"servidor": "[^"]*"'; done` | Respostas alternando A, B, A, B... |
+| 23 | 🖥️ **PC** | `curl -i http://192.168.56.10/` | `X-Upstream` (escolha do lb) e `X-Backend` (quem respondeu) |
+| 24 | 📦 VM `lb` | `curl http://127.0.0.1:8080/nginx_status` | Status do balanceador; os contadores sobem a cada requisição |
+
+### E. Repositório
 
 | # | Onde | O que mostrar |
 |---|------|---------------|
-| 21 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/` com as configs |
+| 25 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/` com as configs |
 
 ---
 
@@ -636,6 +741,18 @@ Só o exporter da própria VM precisa lê-lo. Numa porta separada e no loopback,
 **Por que a porta 80 dos servidores só aceita o lb?**
 Para que todo o tráfego passe pelo balanceador. Se o PC pudesse acessar A e B direto, haveria requisições fora do balanceamento e as métricas ficariam distorcidas.
 
+**Por que o upstream aponta para a porta 80 e não para a 5000?**
+O enunciado exige que o balanceador fale com os Nginx dos servidores, não com a aplicação. E a 5000 só escuta em `127.0.0.1`, então nem seria alcançável pela rede.
+
+**Como funciona o round robin?**
+O Nginx percorre a lista do `upstream` em ordem: a 1ª requisição vai para A, a 2ª para B, a 3ª para A... É o padrão quando nenhum algoritmo é declarado. Funciona bem quando os servidores são iguais, como aqui.
+
+**O que acontece se um backend cair?**
+Com `proxy_connect_timeout 2s` e `proxy_next_upstream`, o `lb` desiste do servidor em até 2 s e reenvia a requisição para o outro; com `max_fails=1 fail_timeout=10s`, o servidor que falhou fica 10 s fora da rotação. (Será demonstrado no cenário 3.)
+
+**Por que a porta 80 do lb só aceita o PC?**
+O PC é o único cliente: é dele que saem os testes e o gerador de carga. Liberar só o necessário é o princípio do firewall do projeto.
+
 **Como vocês provam que a porta 5000 não é acessível?**
 `ss` mostra que ela escuta só em `127.0.0.1`, e o `curl` de fora (PC ou outra VM) falha por timeout, porque o firewall descarta o pacote.
 
@@ -656,6 +773,7 @@ Para que todo o tráfego passe pelo balanceador. Se o PC pudesse acessar A e B d
 | `curl` sem resposta logo após o `restart` | A aplicação ainda estava subindo | `systemctl status app` e `curl -v` |
 | `ufw: ERROR: Wrong number of arguments` | Faltou o número da porta na regra | `sudo ufw allow from 192.168.56.10 to any port 80 proto tcp` |
 | `curl: Protocol "htt" not supported` / `Bad hostname` | Erro de digitação (`htt://`, `=i` em vez de `-i`) | Conferir o comando; usar ↑ para editar o anterior |
+| Respostas do `for` grudadas numa linha só | `\;` antes do `echo`: a barra fez o `;` virar texto | `;` sem barra, ou filtrar com `grep -o` (uma resposta por linha) |
 
 ---
 
@@ -664,7 +782,7 @@ Para que todo o tráfego passe pelo balanceador. Se o PC pudesse acessar A e B d
 - [x] VMs, rede, hostname, SSH e firewall
 - [x] Aplicação em A e B (somente loopback)
 - [x] Nginx em `srv-a` e `srv-b` como proxy reverso para `127.0.0.1:5000` + `stub_status`
-- [ ] Nginx balanceador no `lb` (upstream round robin) + `stub_status`
+- [x] Nginx balanceador no `lb` (upstream round robin) + `stub_status`
 - [ ] Node Exporter e Nginx Prometheus Exporter nas três VMs (acesso restrito ao PC)
 - [ ] Prometheus no PC: 6 alvos UP com rótulos
 - [ ] Grafana: dashboards de infraestrutura e de Nginx/HTTP
