@@ -1,0 +1,16 @@
+# Serviço systemd: liga a aplicação no boot e reinicia se ela cair
+# Instalar em /etc/systemd/system/app.service
+
+[Unit]
+Description=Aplicacao HTTP do backend
+After=network.target
+
+[Service]
+Environment=APP_NAME=Servidor A
+Environment=APP_PORT=5000
+ExecStart=/usr/bin/python3 /opt/app/app.py
+User=www-data
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

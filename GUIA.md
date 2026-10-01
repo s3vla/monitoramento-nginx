@@ -110,6 +110,37 @@ sudo ufw allow from IP to any port N proto tcp   # libera porta só para um IP d
 **`git commit`:** `[main 085978c]` = branch e ID curto do commit · `create mode 100644` = arquivo novo com permissão normal.
 **`git push`:** `ee06e3e..085978c main -> main` = o remoto avançou do commit antigo para o novo.
 
+## Serviços (systemd)
+
+O systemd liga, desliga e vigia programas. Cada serviço tem um arquivo `.service` em `/etc/systemd/system/`.
+
+```bash
+sudo systemctl daemon-reload       # relê os arquivos .service depois de criar ou editar
+sudo systemctl enable --now nome   # enable = sobe no boot; --now = liga já
+sudo systemctl restart nome        # reinicia (necessário para aplicar mudanças)
+systemctl status nome --no-pager   # "active (running)" = ok; "failed" = erro listado embaixo
+journalctl -u nome -n 30           # últimas 30 linhas de log do serviço
+```
+- Seções: `[Unit]` (descrição/ordem) · `[Service]` (como rodar) · `[Install]` (quando subir).
+- `Environment="CHAVE=valor com espaço"`: **aspas** quando o valor tem espaço, senão é cortado.
+- `User=`: rodar sem root limita o estrago se o programa for comprometido.
+
+## Testando HTTP e portas
+
+```bash
+curl http://IP:PORTA/rota            # faz uma requisição e mostra a resposta
+curl -v http://IP:PORTA/             # -v mostra cada passo: conexão, cabeçalhos enviados (>) e recebidos (<)
+curl --max-time 3 URL                # desiste após 3 s (útil para provar que algo está bloqueado)
+ss -tlnp                             # portas TCP escutando (t=TCP, l=listen, n=números, p=processo)
+```
+**Lendo o `ss`:** `127.0.0.1:5000` = só local · `0.0.0.0:5000` = todas as interfaces (rede inclusa).
+
+**Erros do `curl`:**
+- `Could not connect` / `Connection refused`: chegou na máquina, mas nada escuta naquela porta/IP.
+- `Connection timed out`: nenhuma resposta, geralmente firewall descartando o pacote.
+- Saída vazia logo após `restart`: o serviço ainda estava subindo; tente de novo ou veja o `status`.
+- Use `http://`, não `https://`, quando o serviço não tem certificado.
+
 ## Clonar VMs
 
 Clone = cópia idêntica. O que precisa mudar para não haver duas máquinas "iguais" na rede:
