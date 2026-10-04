@@ -429,6 +429,12 @@ systemctl status app --no-pager             # deve aparecer "active (running)"
 
 ![app.service](docs/prints/app-service.png)
 
+*Essa print é da primeira versão do arquivo, ainda **sem aspas** nas linhas `Environment`. Foi justamente esse o erro que corrigimos logo depois. A versão final, que está em `app/app.service`, ficou assim:*
+```ini
+Environment="APP_NAME=Servidor A"
+Environment="APP_PORT=5000"
+```
+
 O que cada parte do arquivo faz:
 - `After=network.target`: só sobe depois que a rede estiver pronta.
 - `Environment="APP_NAME=Servidor A"`: o nome que aparece na resposta. **As aspas são obrigatórias**, e foi aqui que tropeçamos (veja abaixo).
@@ -451,9 +457,12 @@ ss -tlnp | grep 5000
 
 Tudo respondeu, e a rota de carga levou ~0,3 s para contar os primos até 300 mil. O `ss` mostrou **`127.0.0.1:5000`**, e não `0.0.0.0:5000`: confirmado que ela só escuta por dentro.
 
-Nessa print, porém, o nome apareceu só como **"Servidor"**, sem o A nem o B. O systemd corta o valor no espaço quando não há aspas. Corrigido com `Environment="APP_NAME=Servidor A"`:
+Nessa print, porém, o nome apareceu só como **"Servidor"**, sem o A nem o B. O systemd corta o valor no espaço quando não há aspas. Colocamos as aspas, recarregamos o serviço e testamos de novo:
 
 ![srv-a respondendo](docs/prints/app-nome-srv-a.png)
+
+No `srv-b`, o primeiro `curl` depois do `restart` não mostrou nada: a aplicação ainda estava subindo. Com o `curl -v`, que mostra cada etapa da conexão, a resposta veio certa:
+
 ![srv-b respondendo](docs/prints/app-nome-srv-b.png)
 
 ### Provando que de fora não entra
@@ -464,14 +473,16 @@ curl --max-time 3 http://192.168.56.11:5000/
 
 ![Porta 5000 inacessível](docs/prints/app-porta-bloqueada.png)
 
-Rodamos esse comando de lugares diferentes e recebemos dois erros diferentes. Os dois fazem sentido:
+Rodamos esse comando de dois lugares e recebemos dois erros diferentes. Os dois fazem sentido:
 
 | De onde | O que aconteceu | Por quê |
 |---------|-----------------|---------|
-| 📦 Do próprio `srv-a` | `Could not connect`, na hora | Nada escuta no IP de rede, só no interno. A conexão é **recusada**. |
-| 📦 Do `srv-b` ou 🖥️ do PC | `Connection timed out` em 3 s | O **firewall** descarta o pacote sem responder. |
+| 📦 Do próprio `srv-a` | `Could not connect`, na hora (0 ms) | Nada escuta no IP de rede, só no interno. A conexão é **recusada**. |
+| 📦 Do `srv-b` | `Connection timed out` depois de 3 s | O **firewall** do `srv-a` descarta o pacote sem responder. |
 
-São duas proteções independentes: mesmo que uma falhasse, a outra seguraria.
+São duas proteções independentes: mesmo que uma falhasse, a outra seguraria. Do PC, o resultado é o mesmo do `srv-b` (timeout), porque a regra do firewall é a mesma; esse é o teste que mostramos ao vivo na apresentação.
+
+*Na print, digitamos `https://` por engano. O resultado não muda: a conexão falha antes de qualquer protocolo entrar em jogo. O certo é `http://`, porque a aplicação não tem certificado.*
 
 ---
 
@@ -526,6 +537,8 @@ ss -tlnp | grep -E ':80|:8080'
 ```
 
 ![Proxy no srv-a](docs/prints/nginx-srv-a-proxy.png)
+
+*O resultado do `nginx_status` e do `ss` aparece na print do `srv-b`, logo acima: os dois servidores têm a mesma configuração.*
 
 Na resposta, `Server: nginx/1.28.3` e `X-Backend: srv-a` mostram que ela passou pelo Nginx antes de chegar à aplicação. Já o `nginx_status` mostra:
 - `Active connections`: conexões abertas agora.
@@ -678,6 +691,8 @@ ss -tlnp | grep -E ':9100|:9113'
 ![Exporters no srv-a](docs/prints/exp-srv-a-local.png)
 ![Exporters no srv-b](docs/prints/exp-srv-b-local.png)
 
+O `grep "^node_load1"` também trouxe o `node_load15`, porque o nome começa igual: um é a carga média do último minuto, o outro a dos últimos 15 minutos. Os exporters aparecem escutando em `*` (todas as interfaces); quem limita o acesso é o firewall.
+
 O `nginx_up 1` nas três VMs diz que o exporter conseguiu ler o status. Se viesse 0, o caminho estaria errado ou o Nginx estaria parado. O `node_load1` alto logo depois da instalação é normal: o `apt` tinha acabado de trabalhar.
 
 ### Testando do PC, como o Prometheus fará
@@ -751,6 +766,8 @@ docker compose ps
 
 ![docker compose up](docs/prints/prom-compose-up.png)
 
+*Nessa primeira execução, as imagens ainda estavam como `latest`. Depois, ao registrar as versões, fixamos `v3.15.0` e `13.0.2` no `docker-compose.yml`, que eram exatamente as versões que o `latest` tinha baixado.*
+
 A coluna `PORTS` aparece vazia por causa do `network_mode: host`. Os containers não mapeiam portas, usam direto as do PC.
 
 ### Os seis alvos
@@ -784,6 +801,8 @@ O Grafana subiu junto, pelo mesmo `docker-compose.yml`. Em vez de configurar tud
 ![Pasta com os dois dashboards](docs/prints/graf-pasta.png)
 
 ### Dashboard 1: Infraestrutura das VMs
+
+*As prints desta seção são da primeira versão do layout, em que algumas legendas ficavam cortadas. Depois aumentamos a altura dos painéis; as prints dos experimentos já mostram o layout final.*
 
 ![Infraestrutura sem tráfego](docs/prints/graf-infra-base.png)
 ![Disco](docs/prints/graf-infra-disco.png)
