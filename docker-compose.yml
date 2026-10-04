@@ -7,7 +7,7 @@
 
 services:
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.15.0                 # versão fixa: ambiente reproduzível
     container_name: prometheus
     network_mode: host                                   # Prometheus em http://localhost:9090
     volumes:
@@ -21,7 +21,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana-oss:latest                    # edição open source (OSS)
+    image: grafana/grafana-oss:13.0.2                    # edição open source (OSS), versão fixa
     container_name: grafana
     network_mode: host                                   # Grafana em http://localhost:3000
     volumes:

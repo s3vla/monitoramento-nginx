@@ -1,31 +1,35 @@
-# Monitoramento de Infraestrutura — Nginx, Prometheus e Grafana
+# Monitoramento de Infraestrutura com Nginx, Prometheus e Grafana
 
-Ambiente distribuído com **balanceamento de carga** (Nginx) entre dois servidores de aplicação e **observabilidade** (Prometheus + Grafana). Este README é o passo a passo de tudo o que foi feito, na ordem em que foi feito, e serve de roteiro para reproduzir o ambiente e para a demonstração ao professor.
+Este repositório conta como montamos, do zero, um pequeno ambiente distribuído: um **balanceador Nginx** que reparte as requisições entre **dois servidores de aplicação**, e uma camada de **observabilidade** com Prometheus e Grafana para enxergar o que acontece lá dentro.
+
+A ideia aqui não é só listar comandos. Fomos registrando cada etapa na ordem em que ela aconteceu, explicando **por que** fizemos de cada jeito, o que deu errado no caminho e o que os números mostraram no final. Quem seguir este README do começo ao fim consegue reconstruir o ambiente inteiro.
+
+> 📋 Para a demonstração ao professor, existe um roteiro separado: **[ROTEIRO.md](ROTEIRO.md)**.
+> 📚 Para estudar os comandos e conceitos com calma: **[GUIA.md](GUIA.md)**.
 
 ## Sumário
 
-1. [Arquitetura](#arquitetura)
-2. [Ambiente: VMs, IPs, portas e versões](#ambiente)
-3. [Como ler este guia](#como-ler-este-guia)
-4. [Etapa 1 — Criar a VM1 no VirtualBox](#etapa-1--criar-a-vm1-no-virtualbox)
-5. [Etapa 2 — Configurar a VM1 (lb)](#etapa-2--configurar-a-vm1-lb)
-6. [Etapa 3 — Clonar a VM2 (srv-a) e a VM3 (srv-b)](#etapa-3--clonar-a-vm2-srv-a-e-a-vm3-srv-b)
-7. [Etapa 4 — Aplicação nos servidores A e B](#etapa-4--aplicação-nos-servidores-a-e-b)
-8. [Etapa 5 — Nginx nos servidores A e B](#etapa-5--nginx-nos-servidores-a-e-b)
-9. [Etapa 6 — Nginx balanceador no lb](#etapa-6--nginx-balanceador-no-lb)
-10. [Etapa 7 — Exporters nas três VMs](#etapa-7--exporters-nas-três-vms)
-11. [Etapa 8 — Prometheus no PC](#etapa-8--prometheus-no-pc)
-12. [Etapa 9 — Grafana e dashboards](#etapa-9--grafana-e-dashboards)
-13. [Etapa 10 — Experimentos](#etapa-10--experimentos)
-14. [Análise: resultados, limitações e melhorias](#análise-resultados-limitações-e-melhorias)
-15. [Roteiro de demonstração ao professor](#roteiro-de-demonstração-ao-professor)
-16. [Decisões técnicas (perguntas prováveis)](#decisões-técnicas-perguntas-prováveis)
-17. [Dificuldades e soluções](#dificuldades-e-soluções)
-18. [Entrega: checklist do enunciado](#entrega-checklist-do-enunciado)
+1. [Visão geral](#visão-geral)
+2. [O ambiente em números](#o-ambiente-em-números)
+3. [Antes de começar: como ler este guia](#antes-de-começar-como-ler-este-guia)
+4. [Etapa 1 — Criando a primeira VM](#etapa-1--criando-a-primeira-vm)
+5. [Etapa 2 — Preparando o balanceador (lb)](#etapa-2--preparando-o-balanceador-lb)
+6. [Etapa 3 — Clonando os servidores A e B](#etapa-3--clonando-os-servidores-a-e-b)
+7. [Etapa 4 — A aplicação](#etapa-4--a-aplicação)
+8. [Etapa 5 — Nginx na frente da aplicação](#etapa-5--nginx-na-frente-da-aplicação)
+9. [Etapa 6 — O balanceador](#etapa-6--o-balanceador)
+10. [Etapa 7 — Os exporters](#etapa-7--os-exporters)
+11. [Etapa 8 — Prometheus](#etapa-8--prometheus)
+12. [Etapa 9 — Grafana](#etapa-9--grafana)
+13. [Etapa 10 — Os experimentos](#etapa-10--os-experimentos)
+14. [O que aprendemos: resultados, limitações e melhorias](#o-que-aprendemos-resultados-limitações-e-melhorias)
+15. [Por que fizemos assim](#por-que-fizemos-assim)
+16. [Tropeços no caminho](#tropeços-no-caminho)
+17. [O que foi entregue](#o-que-foi-entregue)
 
 ---
 
-## Arquitetura
+## Visão geral
 
 ```
                  ┌──────────────────── PC (host) 192.168.56.1 ────────────────────┐
@@ -43,316 +47,319 @@ Ambiente distribuído com **balanceamento de carga** (Nginx) entre dois servidor
                                        └──────────────────┘               └──────────────────┘
 ```
 
-Fluxo de uma requisição: **cliente → Nginx do `lb` → Nginx do `srv-a` ou `srv-b` (alternando) → aplicação local em `127.0.0.1:5000`**.
+O caminho de uma requisição é este: ela sai do PC, chega no **Nginx do `lb`**, que escolhe entre o **Nginx do `srv-a`** e o **Nginx do `srv-b`** (alternando entre eles), e esse Nginx repassa para a **aplicação**, que só escuta dentro da própria máquina, em `127.0.0.1:5000`.
+
+Em paralelo, cada VM tem dois "informantes" (os **exporters**), um sobre a máquina e outro sobre o Nginx. O **Prometheus**, rodando no PC, pergunta a eles a cada 5 segundos como as coisas estão. O **Grafana** transforma essas respostas em gráficos.
 
 ---
 
-## Ambiente
+## O ambiente em números
 
-### Máquinas virtuais
+### As máquinas
 
-| VM  | Hostname | Papel             | IP host-only  | vCPU | RAM     | Disco |
-|-----|----------|-------------------|---------------|------|---------|-------|
-| VM1 | `lb`     | Nginx balanceador | 192.168.56.10 | 1    | 1642 MiB* | 10 GB |
-| VM2 | `srv-a`  | Servidor A        | 192.168.56.11 | 1    | 1642 MiB* | 10 GB |
-| VM3 | `srv-b`  | Servidor B        | 192.168.56.12 | 1    | 1642 MiB* | 10 GB |
-| PC  | —        | Host (Prometheus, Grafana, carga) | 192.168.56.1 | — | — | — |
+| VM  | Nome    | Papel             | IP            | vCPU | RAM        | Disco |
+|-----|---------|-------------------|---------------|------|------------|-------|
+| VM1 | `lb`    | Nginx balanceador | 192.168.56.10 | 1    | 1642 MiB\* | 10 GB |
+| VM2 | `srv-a` | Servidor A        | 192.168.56.11 | 1    | 1642 MiB\* | 10 GB |
+| VM3 | `srv-b` | Servidor B        | 192.168.56.12 | 1    | 1642 MiB\* | 10 GB |
+| PC  | —       | Prometheus, Grafana e gerador de carga | 192.168.56.1 | — | — | — |
 
-\* Memória total vista pelo sistema (`free -m`), idêntica nas três VMs. O valor configurado no VirtualBox (*Settings → System → Base Memory*) é um pouco maior, porque o kernel reserva uma parte. `srv-a` e `srv-b` têm exatamente o mesmo hardware (1 vCPU, mesma RAM), o que garante uma comparação justa do balanceamento.
+\* É a memória que o sistema enxerga (`free -m`). O valor configurado no VirtualBox é um pouco maior, porque o kernel reserva uma parte. O importante é que **A e B são idênticos**, com o mesmo processador e a mesma memória. Sem isso, a comparação do balanceamento não seria justa.
 
-### Rede de cada VM
+### A rede de cada VM
 
-| Interface | Adaptador VirtualBox | Modo      | Endereço              | Função |
-|-----------|----------------------|-----------|-----------------------|--------|
-| `enp0s3`  | Adapter 1            | NAT       | 10.0.2.15 (DHCP)      | Internet (instalar pacotes) |
-| `enp0s8`  | Adapter 2            | Host-only | 192.168.56.1x (fixo)  | VMs ↔ VMs e VMs ↔ PC |
+Cada máquina tem duas placas de rede, cada uma com uma função:
 
-### Portas
+| Placa    | Tipo      | Endereço             | Para quê |
+|----------|-----------|----------------------|----------|
+| `enp0s3` | NAT       | 10.0.2.15 (automático) | Sair para a internet e instalar pacotes |
+| `enp0s8` | Host-only | 192.168.56.1x (fixo)   | Conversar com as outras VMs e com o PC |
 
-| Serviço   | Onde         | Escuta em        | Quem acessa |
-|-----------|--------------|------------------|-------------|
-| SSH       | todas as VMs | `0.0.0.0:22`     | PC (administração) |
-| Nginx balanceador | lb   | `0.0.0.0:80`     | Somente o PC (192.168.56.1), pelo firewall |
-| Nginx `stub_status` | lb | `127.0.0.1:8080` | Somente a própria VM (exporter local) |
-| Nginx (site) | srv-a, srv-b | `0.0.0.0:80`   | Somente o `lb` (192.168.56.10), pelo firewall |
-| Nginx `stub_status` | srv-a, srv-b | `127.0.0.1:8080` | Somente a própria VM (exporter local) |
-| Aplicação | srv-a, srv-b | `127.0.0.1:5000` | Somente a própria VM (Nginx local) |
-| Node Exporter | todas as VMs | `*:9100` | Somente o PC (Prometheus), pelo firewall |
-| Nginx Prometheus Exporter | todas as VMs | `*:9113` | Somente o PC (Prometheus), pelo firewall |
-| Prometheus | PC (Docker) | `localhost:9090` | Navegador do PC |
-| Grafana    | PC (Docker) | `localhost:3000` | Navegador do PC |
+### Quem escuta onde (e quem pode entrar)
+
+| Serviço | Onde | Porta | Quem pode acessar |
+|---------|------|-------|-------------------|
+| SSH | todas as VMs | 22 | O PC, para administrar |
+| Nginx balanceador | lb | 80 | Só o PC |
+| Nginx dos servidores | srv-a, srv-b | 80 | Só o `lb` |
+| Status do Nginx (`stub_status`) | todas as VMs | 8080 (local) | Só a própria VM |
+| Aplicação | srv-a, srv-b | 5000 (local) | Só a própria VM |
+| Node Exporter | todas as VMs | 9100 | Só o PC |
+| Nginx Exporter | todas as VMs | 9113 | Só o PC |
+| Prometheus | PC (Docker) | 9090 | Navegador do PC |
+| Grafana | PC (Docker) | 3000 | Navegador do PC |
 
 ### Versões
 
-| Software      | Versão |
-|---------------|--------|
-| Hypervisor    | Oracle VirtualBox |
-| Sistema       | Ubuntu Server 26.04.1 LTS |
-| Kernel        | 7.0.0-34-generic |
-| Nginx         | 1.28.3 (Open Source) |
-| Python        | 3.14.4 |
-| Node Exporter | pacote `prometheus-node-exporter` do Ubuntu |
-| Nginx Prometheus Exporter | pacote `prometheus-nginx-exporter` do Ubuntu |
-| PC (host)     | Arch Linux |
-| Docker / Compose | 29.8.1 / 5.5.1 |
-| Prometheus    | imagem `prom/prometheus:latest` |
-| Grafana OSS   | imagem `grafana/grafana-oss:latest` |
-| Gerador de carga | `hey`, via imagem Docker `williamyeh/hey` |
-| curl          | 8.18.0 |
-| Usuário admin | `ram` |
+| Componente | Versão |
+|------------|--------|
+| VirtualBox | Oracle VirtualBox |
+| Sistema das VMs | Ubuntu Server 26.04.1 LTS (kernel 7.0.0-34) |
+| Nginx | 1.28.3 (Open Source) |
+| Python | 3.14.4 |
+| Node Exporter | 1.10.2 |
+| Nginx Prometheus Exporter | 1.5.1 |
+| Prometheus | 3.15.0 |
+| Grafana OSS | 13.0.2 |
+| PC | Arch Linux, Docker 29.8.1, Compose 5.5.1 |
+| Gerador de carga | `hey` (imagem Docker `williamyeh/hey`) |
+| curl | 8.18.0 |
 
-### Estrutura do repositório
+Para conferir as versões:
+```bash
+# numa VM qualquer
+nginx -v
+prometheus-node-exporter --version 2>&1 | head -1
+prometheus-nginx-exporter --version 2>&1 | head -1
+# no PC
+docker exec prometheus prometheus --version | head -1
+docker exec grafana grafana server -v
+```
+
+### Como o repositório está organizado
 
 ```
 monitoramento-nginx/
-├── README.md            # este passo a passo
-├── GUIA.md              # comandos e conceitos explicados (estudo)
-├── docker-compose.yml   # sobe Prometheus e Grafana no PC
-├── prometheus/
-│   └── prometheus.yml   # os 6 alvos e os rótulos
+├── README.md            ← você está aqui
+├── ROTEIRO.md           ← roteiro da apresentação
+├── GUIA.md              ← comandos e conceitos para estudo
+├── docker-compose.yml   ← sobe Prometheus e Grafana no PC
+├── prometheus/prometheus.yml
 ├── grafana/
-│   ├── provisioning/
-│   │   ├── datasources/prometheus.yml   # fonte de dados cadastrada automaticamente
-│   │   └── dashboards/dashboards.yml    # carrega os JSON da pasta dashboards/
-│   └── dashboards/
-│       ├── infraestrutura.json          # dashboard 1 (exportação JSON exigida)
-│       └── nginx.json                   # dashboard 2 (exportação JSON exigida)
-├── lb/netplan.yaml      # rede da VM1
-├── srv-a/netplan.yaml   # rede da VM2
-├── srv-b/netplan.yaml   # rede da VM3
-├── app/
-│   ├── app.py           # aplicação dos servidores A e B
-│   └── app.service      # serviço systemd da aplicação
-├── nginx/
-│   ├── backend.conf     # Nginx dos servidores A e B (proxy reverso + stub_status)
-│   └── lb.conf          # Nginx balanceador (upstream round robin + stub_status)
-├── exporters/
-│   └── prometheus-nginx-exporter   # configuração do Nginx Exporter (igual nas 3 VMs)
-└── docs/prints/         # evidências (capturas de tela)
+│   ├── provisioning/    ← fonte de dados e carregador de dashboards
+│   └── dashboards/      ← os dois dashboards em JSON
+├── lb/, srv-a/, srv-b/  ← configuração de rede de cada VM (netplan)
+├── app/                 ← aplicação (app.py) e serviço (app.service)
+├── nginx/               ← backend.conf (A e B) e lb.conf (balanceador)
+├── exporters/           ← configuração do Nginx Exporter
+└── docs/prints/         ← as capturas de tela usadas aqui
 ```
 
----
-
-## Como ler este guia
-
-Cada passo começa dizendo **onde** o comando é executado:
-
-| Marcação | Significa |
-|----------|-----------|
-| 🖥️ **PC** | Terminal do computador local (fora das VMs) |
-| 🧰 **VirtualBox** | Interface gráfica do VirtualBox |
-| 📦 **VM `nome`** | Terminal dentro da VM, pela janela do VirtualBox ou via `ssh ram@IP` |
-
-> **Dica:** o prompt mostra em qual máquina você está (`ram@lb`, `ram@srv-a`, `ram@srv-b`). Confira antes de cada comando.
+A regra que seguimos: **toda configuração criada numa VM foi copiada para cá**. Assim, nada fica só "na cabeça" de quem configurou.
 
 ---
 
-## Etapa 1 — Criar a VM1 no VirtualBox
+## Antes de começar: como ler este guia
 
-### 1.1 Conferir a rede host-only
+Ao longo do texto, cada bloco de comandos diz **onde** ele deve rodar:
 
-🧰 **VirtualBox** → *File → Tools → Network Manager* → aba *Host-only Networks*
+- 🖥️ **PC**: no terminal do computador, fora das VMs.
+- 🧰 **VirtualBox**: na interface gráfica do VirtualBox.
+- 📦 **VM `nome`**: dentro da VM, pela janela do VirtualBox ou por `ssh ram@IP`.
 
-- Deve existir uma rede (ex.: `vboxnet0`) com o IP **192.168.56.1/24**. Esse é o IP do PC nessa rede.
-- Na aba *DHCP Server*, a faixa padrão é **.101 a .254**. Os IPs fixos das VMs (.10, .11, .12) ficam **fora** dela, para não haver conflito.
+> Uma dica que nos salvou mais de uma vez: **olhe o prompt** (`ram@lb`, `ram@srv-a`...) antes de rodar qualquer coisa. Com três VMs abertas, é muito fácil digitar na máquina errada. Aconteceu com a gente.
 
-### 1.2 Criar a VM1
+---
+
+## Etapa 1 — Criando a primeira VM
+
+Começamos por uma única VM, o balanceador. A ideia era deixá-la bem configurada e depois **clonar** para criar os dois servidores, em vez de repetir tudo três vezes.
+
+### A rede host-only
+
+🧰 **VirtualBox** → *File → Tools → Network Manager* → *Host-only Networks*
+
+O VirtualBox cria uma rede privada entre o PC e as VMs, normalmente `vboxnet0`, e o PC ganha o IP **192.168.56.1** nela. Na aba *DHCP Server*, dá para ver que o VirtualBox distribui automaticamente os endereços de **.101 a .254**. Por isso escolhemos **.10, .11 e .12** para as VMs: ficam fora dessa faixa e nunca entram em conflito.
+
+### Criando a VM
 
 🧰 **VirtualBox** → *New*
 
-| Campo | Valor |
-|-------|-------|
-| Nome | `lb` |
-| ISO | Ubuntu Server 26.04.1 LTS |
-| OS Version | detectado pela ISO (na dúvida: *Ubuntu (64-bit)*) |
-| Memória / CPU / Disco | mesma RAM nas três VMs (ver tabela de Ambiente) / 1 vCPU / 10 GB |
+- **Nome:** `lb`
+- **ISO:** Ubuntu Server 26.04.1 LTS
+- **Recursos:** 1 vCPU e 10 GB de disco (a memória está na tabela lá em cima)
+- **Rede** (em *Settings → Network*):
+  - **Adapter 1:** NAT
+  - **Adapter 2:** Host-only (`vboxnet0`)
 
-*Settings → Network*:
-- **Adapter 1:** NAT
-- **Adapter 2:** Host-only Adapter → `vboxnet0`
+A ordem dos adaptadores importa: o Adapter 1 vira `enp0s3` e o 2 vira `enp0s8`. Mantivemos a mesma ordem em todas as VMs para não confundir.
 
-### 1.3 Instalar o Ubuntu Server
+### Instalando o Ubuntu Server
 
-📦 **VM `lb`** (janela do VirtualBox, instalador)
+📦 **VM `lb`** (janela do VirtualBox)
 
-- Rede: deixar as duas placas em DHCP (o IP fixo é configurado depois).
-- Marcar **Install OpenSSH server**.
-- Não instalar snaps extras.
-- Usuário: `ram`.
+Instalação padrão, sem interface gráfica, marcando **Install OpenSSH server** e com o usuário `ram`. Deixamos as duas placas de rede em automático durante a instalação; o IP fixo veio depois.
 
-> ⚠️ Instalar **uma VM por vez**. Com as três instalando juntas e 1 GB cada, o instalador falhou (ver [Dificuldades](#dificuldades-e-soluções)).
+> ⚠️ **Aprendemos do jeito difícil:** na primeira tentativa, instalamos as três VMs ao mesmo tempo e o instalador quebrou. Instale **uma de cada vez**.
 
 ---
 
-## Etapa 2 — Configurar a VM1 (lb)
+## Etapa 2 — Preparando o balanceador (lb)
 
-### 2.1 Atualizar o sistema
+Com o Ubuntu instalado, faltava dar à VM uma identidade: um nome, um endereço fixo, acesso remoto e um firewall.
+
+### Atualizar o sistema
 
 📦 **VM `lb`**
 ```bash
-sudo apt update          # baixa a lista de versões disponíveis
+sudo apt update          # busca a lista do que há de novo
 sudo apt upgrade -y      # instala as atualizações
 ```
 
-### 2.2 Definir o hostname
+### Dar um nome à máquina
 
 📦 **VM `lb`**
 ```bash
 sudo hostnamectl set-hostname lb
-sudo nano /etc/hosts     # trocar o nome antigo na linha 127.0.1.1 por: lb
+sudo nano /etc/hosts     # na linha 127.0.1.1, trocar o nome antigo por: lb
 ```
-Salvar no nano: `Ctrl+O`, Enter, `Ctrl+X`.
+O `/etc/hosts` também precisa mudar, porque é lá que o sistema descobre o IP do próprio nome. Sem isso, o `sudo` fica lento e reclamando.
 
-### 2.3 Configurar IP fixo na host-only
+### Fixar o IP
 
 📦 **VM `lb`**
 ```bash
-ls /etc/netplan/                                    # mostra 00-installer-config.yaml
-sudo nano /etc/netplan/00-installer-config.yaml     # caminho COMPLETO
+ls /etc/netplan/
+sudo nano /etc/netplan/00-installer-config.yaml
 ```
-Conteúdo (indentação com espaços, nunca TAB):
+
 ```yaml
 network:
   version: 2
   ethernets:
-    enp0s3:              # NAT: continua automático e traz a rota para a internet
+    enp0s3:              # NAT: continua automática e é por ela que a VM sai para a internet
       dhcp4: true
-    enp0s8:              # host-only: IP fixo, sem gateway
+    enp0s8:              # host-only: endereço fixo, sem gateway
       dhcp4: false
       addresses:
         - 192.168.56.10/24
 ```
+
 ```bash
-sudo chmod 600 /etc/netplan/00-installer-config.yaml   # netplan exige que só o root leia
-sudo netplan try                                       # aplica; Enter para confirmar (desfaz sozinho em 120 s se não confirmar)
+sudo chmod 600 /etc/netplan/00-installer-config.yaml   # o netplan exige que só o root leia
+sudo netplan try                                       # aplica, mas desfaz sozinho em 120 s se você não confirmar
 ip -4 addr show enp0s8                                 # deve mostrar 192.168.56.10/24
-ping -c 3 google.com                                   # internet continua funcionando pela NAT
+ping -c 3 google.com                                   # a internet continua funcionando?
 ```
 
-### 2.4 Acessar por SSH a partir do PC
+Por que a host-only **não** tem gateway: uma máquina só deve ter **uma** saída padrão para a internet, e essa saída já é a placa NAT. Se as duas tivessem gateway, o tráfego poderia sair pelo lugar errado.
+
+O `netplan try` foi uma boa escolha: se a configuração cortasse o acesso, ela voltaria sozinha.
+
+### Entrar por SSH
 
 🖥️ **PC**
 ```bash
 ping -c 3 192.168.56.10
-ssh ram@192.168.56.10          # "yes" na primeira vez
+ssh ram@192.168.56.10
 ```
-A partir daqui, todo o trabalho nas VMs é feito por SSH (copiar/colar, rolagem).
+A partir daqui, passamos a trabalhar sempre pelo terminal do PC. É bem mais confortável que a janela do VirtualBox: tem copiar e colar e rolagem.
 
-### 2.5 Ativar o firewall
-
-📦 **VM `lb`** (via SSH)
-```bash
-sudo ufw allow OpenSSH         # libera a porta 22 ANTES de ativar
-sudo ufw enable                # responder "y"
-sudo ufw status verbose
-```
-**Resultado:** entrada bloqueada por padrão, exceto 22/tcp; saída liberada; ativo no boot.
-
-![Firewall da VM1](docs/prints/vm1-firewall.webp)
-
-### 2.6 Reiniciar e conferir se tudo persistiu
+### Ligar o firewall
 
 📦 **VM `lb`**
 ```bash
-sudo reboot
+sudo ufw allow OpenSSH         # primeiro libera o SSH...
+sudo ufw enable                # ...depois liga o firewall
+sudo ufw status verbose
 ```
-🖥️ **PC** → reconectar com `ssh ram@192.168.56.10` e rodar:
+A ordem é importante: se o firewall for ligado antes de liberar o SSH, a sessão em que você está trabalhando cai na hora.
+
+O resultado: **tudo que chega é bloqueado, menos o SSH**; tudo que sai é liberado.
+
+![Firewall da VM1](docs/prints/vm1-firewall.webp)
+
+### Conferir se tudo sobrevive a um reboot
+
+📦 **VM `lb`**: `sudo reboot`
+
+🖥️ **PC**, depois de reconectar:
 ```bash
-hostnamectl                    # Static hostname: lb
-ip -4 addr show enp0s8         # 192.168.56.10/24, valid_lft forever (= IP fixo)
+hostnamectl                    # nome: lb
+ip -4 addr show enp0s8         # 192.168.56.10/24 com "valid_lft forever"
 ```
+O `valid_lft forever` é a prova de que o IP é fixo. Se viesse por DHCP, apareceria um prazo de validade.
 
 ![Verificação após reboot](docs/prints/vm1-reboot.webp)
 
-### 2.7 Versionar a configuração de rede
+### Guardar a configuração no repositório
 
-📦 **VM `lb`** — o arquivo só é legível pelo root, então copiar para a home primeiro:
+O arquivo do netplan só pode ser lido pelo root, então primeiro o copiamos para a home dentro da VM e depois o trouxemos para o PC:
+
+📦 **VM `lb`**
 ```bash
 sudo cp /etc/netplan/00-installer-config.yaml ~/ && sudo chown $USER ~/00-installer-config.yaml
-exit
 ```
-🖥️ **PC** (na pasta do repositório)
+🖥️ **PC**
 ```bash
 mkdir -p lb
 scp ram@192.168.56.10:~/00-installer-config.yaml lb/netplan.yaml
-git add .
-git commit -m "chore: config de rede da VM1"
-git push
+git add . && git commit -m "chore: config de rede da VM1" && git push
 ```
 
 ![Cópia e commit da config](docs/prints/vm1-git.webp)
 
 ---
 
-## Etapa 3 — Clonar a VM2 (srv-a) e a VM3 (srv-b)
+## Etapa 3 — Clonando os servidores A e B
 
-A VM1 já estava instalada, atualizada e com firewall; clonar evita refazer tudo. Mas o clone sai **idêntico**, então tudo que identifica a máquina precisa ser trocado.
+Com o `lb` pronto, clonamos para criar o `srv-a` e o `srv-b`. Clonar economiza a instalação inteira, mas tem uma pegadinha: **o clone sai idêntico ao original**, com o mesmo nome, o mesmo IP e a mesma "identidade". Tudo isso precisou ser trocado.
 
-### 3.1 Clonar
+### Clonando
 
 📦 **VM `lb`**: `sudo poweroff`
 
-🧰 **VirtualBox** → botão direito na `lb` → *Clone*
+🧰 **VirtualBox** → botão direito na `lb` → *Clone*:
+- **Nome:** `srv-a` (depois repetimos com `srv-b`)
+- **MAC Address Policy:** *Generate new MAC addresses for all network adapters*. Duas placas com o mesmo MAC na mesma rede é confusão garantida.
+- **Full clone:** cada VM com seu próprio disco.
 
-| Campo | Valor |
-|-------|-------|
-| Nome | `srv-a` (depois repetir com `srv-b`) |
-| MAC Address Policy | **Generate new MAC addresses for all network adapters** |
-| Tipo | **Full clone** |
+### Dando uma identidade nova a cada clone
 
-### 3.2 Ajustar cada clone
+Fizemos isso pela **janela do VirtualBox** e **com o `lb` desligado**, porque o clone liga com o mesmo IP `.10` do original.
 
-📦 **VM `srv-a`** pela **janela do VirtualBox** (não por SSH), **com a `lb` desligada**: o clone liga com o mesmo IP `.10` dela.
-
+📦 **VM `srv-a`**
 ```bash
-# nome
+# nome novo
 sudo hostnamectl set-hostname srv-a
-sudo nano /etc/hosts                              # 127.0.1.1 lb → srv-a
+sudo nano /etc/hosts                              # 127.0.1.1: lb → srv-a
 
-# machine-id (identificador único da instalação)
+# machine-id novo (o "RG" da instalação; clones herdam o mesmo)
 sudo rm -f /etc/machine-id /var/lib/dbus/machine-id
 sudo systemd-machine-id-setup
 sudo ln -sf /etc/machine-id /var/lib/dbus/machine-id
 
-# chaves SSH do servidor
+# chaves SSH novas (cada servidor precisa da sua)
 sudo rm /etc/ssh/ssh_host_*
 sudo dpkg-reconfigure openssh-server
 
-# IP fixo
-sudo nano /etc/netplan/00-installer-config.yaml   # trocar .10 por .11
+# IP novo
+sudo nano /etc/netplan/00-installer-config.yaml   # .10 → .11
 sudo netplan apply
 sudo reboot
 ```
-📦 **VM `srv-b`**: mesmos comandos, com `srv-b` e IP `.12`.
+No `srv-b`, fizemos a mesma coisa com o nome `srv-b` e o IP `.12`.
 
-| Item         | lb (original) | srv-a | srv-b |
-|--------------|---------------|-------|-------|
-| Hostname     | lb            | srv-a | srv-b |
-| IP host-only | .10           | .11   | .12   |
-| MAC          | original      | novo  | novo  |
-| machine-id   | original      | novo  | novo  |
-| Chaves SSH   | originais     | novas | novas |
+| O que mudou  | lb        | srv-a | srv-b |
+|--------------|-----------|-------|-------|
+| Nome         | lb        | srv-a | srv-b |
+| IP           | .10       | .11   | .12   |
+| MAC          | original  | novo  | novo  |
+| machine-id   | original  | novo  | novo  |
+| Chaves SSH   | originais | novas | novas |
 
-O firewall veio clonado com o SSH já liberado.
+O firewall veio junto no clone, já com o SSH liberado.
 
-### 3.3 Limpar as chaves SSH antigas no PC
+### O susto do SSH
 
-Como as chaves dos servidores mudaram, o PC bloqueia a conexão com **REMOTE HOST IDENTIFICATION HAS CHANGED**:
+Na primeira vez que tentamos conectar no `srv-a` pelo PC, apareceu este aviso assustador:
 
 ![Aviso de chave SSH alterada](docs/prints/app-hostkey-aviso.png)
 
+Não era ataque nenhum. Como trocamos as chaves do servidor, o PC estranhou: ele se lembrava da chave antiga para aquele IP. Bastou mandar o PC esquecer:
+
 🖥️ **PC**
 ```bash
-ssh-keygen -R 192.168.56.11    # apaga a chave antiga guardada para esse IP
+ssh-keygen -R 192.168.56.11
 ssh-keygen -R 192.168.56.12
 ```
 ![Remoção das chaves antigas](docs/prints/app-hostkey-fix.png)
 
-Na próxima conexão, responder `yes` para aceitar a chave nova.
+Na conexão seguinte, respondemos `yes` para aceitar a chave nova.
 
-### 3.4 Verificar a comunicação entre as VMs
+### As três se enxergam?
 
-📦 **VM `srv-a`** (com as três VMs ligadas)
+📦 **VM `srv-a`**, com as três VMs ligadas:
 ```bash
 ping -c 2 192.168.56.10
 ping -c 2 192.168.56.11
@@ -361,17 +368,13 @@ ping -c 2 192.168.56.12
 
 ![Ping do srv-a para as três VMs](docs/prints/vm2-ping.png)
 
-| Destino | Perda | Tempo médio | Leitura |
-|---------|-------|-------------|---------|
-| .10 (lb)    | 0% | ~0,45 ms | alcança o balanceador |
-| .11 (srv-a) | 0% | ~0,05 ms | ela mesma: o pacote não sai da máquina |
-| .12 (srv-b) | 0% | ~0,52 ms | alcança o outro servidor |
+Todas responderam sem perder nenhum pacote. Dois detalhes chamaram a atenção:
+- O ping para **ela mesma** (.11) levou ~0,05 ms, uns 10 vezes menos que para as outras. Faz sentido: o pacote nem sai da máquina.
+- O `ttl=64` chegou intacto. O Linux começa com 64, e cada roteador no caminho tira 1. Ou seja, **não há roteador nenhum entre as VMs**: estão todas na mesma rede.
 
-`ttl=64` sem decréscimo = nenhum roteador no caminho; as três estão na mesma rede.
+### Guardando as configurações
 
-### 3.5 Versionar as configurações de rede
-
-📦 **VM `srv-a`** e 📦 **VM `srv-b`** (cada uma)
+📦 **VM `srv-a`** e **VM `srv-b`**
 ```bash
 sudo cp /etc/netplan/00-installer-config.yaml ~/ && sudo chown $USER ~/00-installer-config.yaml
 ```
@@ -385,60 +388,58 @@ git add . && git commit -m "chore: config de rede da VM2 e VM3" && git push
 
 ---
 
-## Etapa 4 — Aplicação nos servidores A e B
+## Etapa 4 — A aplicação
 
-### O que é a aplicação
+O enunciado pedia uma aplicação HTTP simples em cada servidor. Escolhemos **Python, só com a biblioteca padrão**: ele já vem no Ubuntu, então não foi preciso instalar nada. O **mesmo código** roda em A e B; a única diferença é uma variável que diz o nome do servidor.
 
-Python 3, só biblioteca padrão (`http.server`): já vem no Ubuntu, nada para instalar. **O mesmo `app.py` roda nas duas VMs**; o nome muda pela variável `APP_NAME` no serviço.
+### O que ela responde
 
-| Rota | Resposta | Para quê |
-|------|----------|----------|
-| `/` | servidor, hostname, data e hora | Ver qual instância respondeu (alternância do balanceamento) |
-| `/health` | `"status": "ok"` | Verificação de saúde |
-| `/carga?n=300000` | quantidade de primos até `n` e tempo gasto | Gerar consumo de CPU nos testes de carga |
+| Rota | O que devolve | Para que serve |
+|------|---------------|----------------|
+| `/` | Nome do servidor, data e hora | Ver quem respondeu (e assim enxergar o balanceamento) |
+| `/health` | `"status": "ok"` | Verificar se está viva |
+| `/carga?n=300000` | Quantos números primos existem até `n` e quanto tempo levou | Gerar carga de CPU nos testes |
 
-**Rota de carga:** conta números primos testando divisões, de propósito ineficiente e só de CPU. O `n` controla a intensidade (padrão 50 mil, teto 2 milhões para não travar a VM). Permite provocar aumento de CPU e de tempo de resposta de forma controlada e repetível, visível no Grafana.
+**Sobre a rota de carga:** ela conta números primos do jeito mais "braçal" possível, testando divisão por divisão. É ineficiente de propósito: queremos que ela gaste CPU. O `n` regula a intensidade (o padrão é 50 mil, com um teto de 2 milhões para ninguém travar a VM sem querer). Com ela, conseguimos provocar uso de CPU e respostas mais lentas de forma **controlada e repetível**, e ver isso nos gráficos.
 
-**Por que só em `127.0.0.1`:** a porta 5000 não existe para a rede. Só o Nginx da própria VM alcança a aplicação, via `proxy_pass`.
+**Por que só em `127.0.0.1`:** a aplicação escuta apenas no endereço interno da máquina. Para a rede, a porta 5000 simplesmente não existe. O único jeito de chegar nela é pelo Nginx da própria VM.
 
-### 4.1 Enviar os arquivos para as VMs
+### Levando os arquivos para as VMs
 
-🖥️ **PC** (na pasta do repositório)
+🖥️ **PC**
 ```bash
 scp app/app.py app/app.service ram@192.168.56.11:~/
 scp app/app.py app/app.service ram@192.168.56.12:~/
 ```
 
-### 4.2 Instalar como serviço
+### Transformando em serviço
 
-📦 **VM `srv-a`** e depois 📦 **VM `srv-b`**
+Em vez de rodar o Python "na mão", criamos um **serviço do systemd**. Assim, a aplicação sobe sozinha quando a VM liga e volta sozinha se cair.
+
+📦 **VM `srv-a`** e depois **VM `srv-b`**
 ```bash
 sudo mkdir -p /opt/app
 sudo mv ~/app.py /opt/app/
 sudo mv ~/app.service /etc/systemd/system/
-sudo nano /etc/systemd/system/app.service   # SÓ no srv-b: trocar para "APP_NAME=Servidor B"
-sudo systemctl daemon-reload                # faz o systemd ler o arquivo novo
+sudo nano /etc/systemd/system/app.service   # só no srv-b: trocar para "APP_NAME=Servidor B"
+sudo systemctl daemon-reload                # o systemd relê os serviços
 sudo systemctl enable --now app             # liga agora e em todo boot
-systemctl status app --no-pager             # deve mostrar active (running)
+systemctl status app --no-pager             # deve aparecer "active (running)"
 ```
-
-`/etc/systemd/system/app.service`:
 
 ![app.service](docs/prints/app-service.png)
 
-| Linha | Função |
-|-------|--------|
-| `After=network.target` | Só sobe depois da rede |
-| `Environment="APP_NAME=Servidor A"` | Nome que aparece na resposta (**com aspas**, por causa do espaço) |
-| `Environment="APP_PORT=5000"` | Porta interna |
-| `ExecStart=/usr/bin/python3 /opt/app/app.py` | Comando que inicia a aplicação |
-| `User=www-data` | Roda sem privilégios de root |
-| `Restart=on-failure` | Religa sozinha se cair |
-| `WantedBy=multi-user.target` | Sobe em todo boot (ativado pelo `enable`) |
+O que cada parte do arquivo faz:
+- `After=network.target`: só sobe depois que a rede estiver pronta.
+- `Environment="APP_NAME=Servidor A"`: o nome que aparece na resposta. **As aspas são obrigatórias**, e foi aqui que tropeçamos (veja abaixo).
+- `ExecStart=...`: o comando que inicia a aplicação.
+- `User=www-data`: roda com um usuário sem poderes. Se algo der errado, o estrago fica limitado.
+- `Restart=on-failure`: se cair, sobe de novo.
+- `WantedBy=multi-user.target`: faz parte do boot normal.
 
-### 4.3 Testar localmente
+### Testando por dentro
 
-📦 **VM `srv-a`** e 📦 **VM `srv-b`** (dentro de cada uma; `127.0.0.1` é a própria VM)
+📦 **VM `srv-a`** e **VM `srv-b`**
 ```bash
 curl http://127.0.0.1:5000/
 curl http://127.0.0.1:5000/health
@@ -448,108 +449,92 @@ ss -tlnp | grep 5000
 
 ![Testes locais](docs/prints/app-testes-locais.png)
 
-- As três rotas respondem; `/carga` com 300 mil levou ~0,3 s.
-- `ss` mostra **`127.0.0.1:5000`** (só loopback), e não `0.0.0.0:5000` (todas as interfaces).
+Tudo respondeu, e a rota de carga levou ~0,3 s para contar os primos até 300 mil. O `ss` mostrou **`127.0.0.1:5000`**, e não `0.0.0.0:5000`: confirmado que ela só escuta por dentro.
 
-*Essa print é anterior à correção das aspas no serviço (o nome saía só "Servidor"). Depois da correção:*
+Nessa print, porém, o nome apareceu só como **"Servidor"**, sem o A nem o B. O systemd corta o valor no espaço quando não há aspas. Corrigido com `Environment="APP_NAME=Servidor A"`:
 
 ![srv-a respondendo](docs/prints/app-nome-srv-a.png)
 ![srv-b respondendo](docs/prints/app-nome-srv-b.png)
 
-### 4.4 Provar que a porta 5000 não é acessível pela rede
+### Provando que de fora não entra
 
-| Onde rodar | Comando | Resultado esperado | Motivo |
-|------------|---------|--------------------|--------|
-| 📦 **VM `srv-a`** | `curl --max-time 3 http://192.168.56.11:5000/` | `Could not connect` (imediato) | Nada escuta no IP de rede `.11:5000`, só no `127.0.0.1:5000`: conexão **recusada** |
-| 📦 **VM `srv-b`** | `curl --max-time 3 http://192.168.56.11:5000/` | `Connection timed out after 3000 ms` | O firewall do `srv-a` **descarta** o pacote sem responder |
-| 🖥️ **PC** | `curl --max-time 3 http://192.168.56.11:5000/` | `Connection timed out after 3000 ms` | Igual ao anterior: firewall descarta |
+```bash
+curl --max-time 3 http://192.168.56.11:5000/
+```
 
 ![Porta 5000 inacessível](docs/prints/app-porta-bloqueada.png)
 
-São **duas camadas de proteção**: a aplicação só escuta no loopback **e** o firewall bloqueia a porta. Mesmo que uma falhasse, a outra impediria o acesso.
+Rodamos esse comando de lugares diferentes e recebemos dois erros diferentes. Os dois fazem sentido:
 
-> Usar `http://`, não `https://`: a aplicação não tem certificado.
+| De onde | O que aconteceu | Por quê |
+|---------|-----------------|---------|
+| 📦 Do próprio `srv-a` | `Could not connect`, na hora | Nada escuta no IP de rede, só no interno. A conexão é **recusada**. |
+| 📦 Do `srv-b` ou 🖥️ do PC | `Connection timed out` em 3 s | O **firewall** descarta o pacote sem responder. |
+
+São duas proteções independentes: mesmo que uma falhasse, a outra seguraria.
 
 ---
 
-## Etapa 5 — Nginx nos servidores A e B
+## Etapa 5 — Nginx na frente da aplicação
 
-Cada servidor ganha um Nginx na frente da aplicação. Ele é a **única porta de entrada** da VM: recebe a requisição do balanceador na porta 80 e repassa para a aplicação em `127.0.0.1:5000`. O enunciado exige isso: o balanceador nunca fala direto com a aplicação.
+Agora cada servidor ganhou um Nginx, que passou a ser a **única porta de entrada** da VM. Ele recebe a requisição do balanceador na porta 80 e repassa para a aplicação lá dentro. O enunciado exige esse caminho: o balanceador nunca fala direto com a aplicação.
 
 ```
-lb ──► srv-a:80 (Nginx) ──proxy_pass──► 127.0.0.1:5000 (app)
-                │
-                └─ 127.0.0.1:8080/nginx_status ──► exporter (etapa 7)
+lb ──► srv-a:80 (Nginx) ──► 127.0.0.1:5000 (aplicação)
+               │
+               └─ 127.0.0.1:8080/nginx_status ──► lido pelo exporter (etapa 7)
 ```
 
-### O arquivo de configuração
+### A configuração (`nginx/backend.conf`)
 
-`nginx/backend.conf` (o **mesmo** nas duas VMs) tem dois blocos `server`:
+O mesmo arquivo serve para A e B. Ele tem duas partes:
 
-| Bloco | Escuta em | Função |
-|-------|-----------|--------|
-| Site principal | `80` | `proxy_pass` para `127.0.0.1:5000`, preservando cabeçalhos |
-| Status | `127.0.0.1:8080` | `stub_status` em `/nginx_status`, só para a própria VM |
+- **O site, na porta 80:** repassa tudo para `127.0.0.1:5000` (`proxy_pass`) e preserva os cabeçalhos importantes: o nome que o cliente pediu (`Host`), o IP de origem (`X-Real-IP`, `X-Forwarded-For`) e o protocolo (`X-Forwarded-Proto`). Sem isso, a aplicação acharia que toda requisição veio do próprio Nginx. Também adicionamos um cabeçalho `X-Backend` dizendo qual VM respondeu.
+- **O status, em `127.0.0.1:8080/nginx_status`:** o `stub_status` do Nginx, com contadores de conexões e requisições. Ele fica no endereço interno e ainda tem um `allow 127.0.0.1; deny all;`, como segunda trava. Só o exporter da própria VM precisa ler isso.
 
-| Diretiva | Para quê |
-|----------|----------|
-| `proxy_pass http://127.0.0.1:5000;` | Repassa a requisição para a aplicação local |
-| `proxy_set_header Host $host;` | A aplicação recebe o nome/IP que o cliente pediu |
-| `proxy_set_header X-Real-IP $remote_addr;` | IP de quem falou com este Nginx (o `lb`) |
-| `proxy_set_header X-Forwarded-For ...;` | Cadeia de IPs: cliente → lb → backend |
-| `proxy_set_header X-Forwarded-Proto $scheme;` | Protocolo original (http/https) |
-| `add_header X-Backend $hostname always;` | Cabeçalho na resposta dizendo qual VM respondeu |
-| `listen 127.0.0.1:8080;` + `allow 127.0.0.1; deny all;` | Status invisível para a rede (duas travas) |
-| `stub_status;` | Contadores de conexões e requisições, lidos pelo exporter |
+### Instalando
 
-**Por que preservar cabeçalhos:** sem eles, para a aplicação toda requisição pareceria vir de `127.0.0.1` (o próprio Nginx), e a origem real se perderia.
-
-### 5.1 Enviar o arquivo para as VMs
-
-🖥️ **PC** (na pasta do repositório)
+🖥️ **PC**
 ```bash
-mkdir -p nginx
-mv ~/Downloads/backend.conf nginx/
+mkdir -p nginx && mv ~/Downloads/backend.conf nginx/
 scp nginx/backend.conf ram@192.168.56.11:~/
 scp nginx/backend.conf ram@192.168.56.12:~/
 ```
 
-### 5.2 Instalar e ativar o Nginx
-
-📦 **VM `srv-a`** e depois 📦 **VM `srv-b`** (comandos idênticos)
+📦 **VM `srv-a`** e **VM `srv-b`**
 ```bash
 sudo apt install -y nginx
 sudo mv ~/backend.conf /etc/nginx/sites-available/backend
-sudo ln -s /etc/nginx/sites-available/backend /etc/nginx/sites-enabled/   # ativa o site (atalho)
-sudo rm /etc/nginx/sites-enabled/default                                  # remove o site padrão (também usava a porta 80)
-sudo nginx -t                                                             # valida a sintaxe ANTES de aplicar
-sudo systemctl reload nginx                                               # aplica sem derrubar conexões
+sudo ln -s /etc/nginx/sites-available/backend /etc/nginx/sites-enabled/   # ativa o site
+sudo rm /etc/nginx/sites-enabled/default                                  # o site padrão também usava a porta 80
+sudo nginx -t                                                             # valida antes de aplicar
+sudo systemctl reload nginx
 sudo ufw allow from 192.168.56.10 to any port 80 proto tcp                # porta 80 só para o lb
 ```
 
-**`sites-available` × `sites-enabled`:** o arquivo fica em `sites-available`; o atalho (`ln -s`) em `sites-enabled` é o que o Nginx carrega. Para desativar um site, basta apagar o atalho.
+O `nginx -t` virou hábito: ele confere a sintaxe antes de aplicar, e assim um erro de digitação não derruba o servidor.
 
 ![Instalação e testes no srv-b](docs/prints/nginx-backend-config.png)
 
-### 5.3 Testar dentro de cada VM
+### Testando por dentro
 
-📦 **VM `srv-a`** e 📦 **VM `srv-b`**
+📦 **VM `srv-a`**
 ```bash
-curl -i http://127.0.0.1/                   # passa pelo Nginx até a aplicação
-curl http://127.0.0.1:8080/nginx_status     # contadores do stub_status
+curl -i http://127.0.0.1/
+curl http://127.0.0.1:8080/nginx_status
 ss -tlnp | grep -E ':80|:8080'
 ```
 
 ![Proxy no srv-a](docs/prints/nginx-srv-a-proxy.png)
 
-- **`curl -i`**: o `-i` mostra os cabeçalhos. `Server: nginx/1.28.3` e `X-Backend: srv-a` provam que a resposta passou pelo Nginx; o corpo veio da aplicação.
-- **`nginx_status`**:
-  - `Active connections`: conexões abertas agora.
-  - `accepts handled requests`: totais de conexões aceitas, conexões tratadas e requisições.
-  - `Reading / Writing / Waiting`: conexões lendo a requisição, escrevendo a resposta e ociosas (keep-alive).
-- **`ss`**: `0.0.0.0:80` (site, aberto à rede, filtrado pelo firewall) e `127.0.0.1:8080` (status, só local).
+Na resposta, `Server: nginx/1.28.3` e `X-Backend: srv-a` mostram que ela passou pelo Nginx antes de chegar à aplicação. Já o `nginx_status` mostra:
+- `Active connections`: conexões abertas agora.
+- `accepts handled requests`: os totais desde que o Nginx ligou.
+- `Reading / Writing / Waiting`: quantas conexões estão lendo, escrevendo ou ociosas.
 
-### 5.4 Testar a partir do balanceador
+São exatamente esses números que o exporter transforma em gráfico.
+
+### O balanceador consegue chegar?
 
 📦 **VM `lb`**
 ```bash
@@ -559,9 +544,7 @@ curl http://192.168.56.12/       # "Servidor B"
 
 ![lb alcançando os dois backends](docs/prints/nginx-lb-para-backends.png)
 
-O `lb` alcança o Nginx dos dois servidores pela rede: é exatamente o caminho que o `upstream` vai usar na etapa 6.
-
-### 5.5 Provar que só o lb acessa os backends
+### E o PC, consegue?
 
 🖥️ **PC**
 ```bash
@@ -570,52 +553,41 @@ curl --max-time 3 http://192.168.56.11/    # timeout
 
 ![PC bloqueado](docs/prints/nginx-pc-bloqueado.png)
 
-| Origem | Porta 80 do srv-a | Por quê |
-|--------|-------------------|---------|
-| 📦 `lb` (192.168.56.10) | ✅ responde | Regra `ufw allow from 192.168.56.10 to any port 80` |
-| 🖥️ PC (192.168.56.1) | ❌ timeout | Não está na regra: o firewall descarta |
+Não consegue, e é isso que queremos. Só o `lb` entra nos servidores, então **todo o tráfego passa obrigatoriamente pelo balanceador**, e as métricas dele contam a história completa.
 
-Assim, todo tráfego para os servidores **obrigatoriamente passa pelo balanceador**, e as métricas do `lb` refletem todas as requisições.
-
-### 5.6 Versionar
-
-🖥️ **PC**
-```bash
-git add .
-git commit -m "feat: Nginx como proxy reverso nos servidores A e B"
-git push
-```
+🖥️ **PC**: `git add . && git commit -m "feat: Nginx como proxy reverso nos servidores A e B" && git push`
 
 ---
 
-## Etapa 6 — Nginx balanceador no lb
+## Etapa 6 — O balanceador
 
-O `lb` é a **porta de entrada** do ambiente: recebe todas as requisições e as distribui entre os Nginx de A e B.
+Agora sim, o coração do trabalho: o Nginx do `lb`, que recebe todas as requisições e as reparte entre A e B.
 
 ```
-PC ──► lb:80 ──upstream (round robin)──┬──► srv-a:80 ──► app A
-                                       └──► srv-b:80 ──► app B
+PC ──► lb:80 ──(round robin)──┬──► srv-a:80 ──► aplicação A
+                              └──► srv-b:80 ──► aplicação B
 ```
 
-### O arquivo de configuração
+### A configuração (`nginx/lb.conf`)
 
-`nginx/lb.conf`:
+```nginx
+upstream backends {
+    server 192.168.56.11:80 max_fails=1 fail_timeout=10s;
+    server 192.168.56.12:80 max_fails=1 fail_timeout=10s;
+}
+```
 
-| Diretiva | Para quê |
-|----------|----------|
-| `upstream backends { server 192.168.56.11:80; server 192.168.56.12:80; }` | Grupo de destinos: os **Nginx** de A e B (porta 80), nunca a aplicação (5000) |
-| *(sem algoritmo declarado)* | **Round robin**: alterna um a um, o padrão do Nginx |
-| `max_fails=1 fail_timeout=10s` | Após 1 falha, o servidor fica 10 s fora da rotação |
-| `proxy_pass http://backends;` | Envia para o grupo, não para um IP fixo |
-| `proxy_set_header ...` | Preserva Host, IP do cliente e protocolo, como nos backends |
-| `proxy_connect_timeout 2s;` | Backend fora do ar: desiste em 2 s (o padrão seria 60 s) |
-| `proxy_next_upstream error timeout http_502 http_503 http_504;` | Se um backend falhar, a mesma requisição é tentada no outro |
-| `add_header X-Upstream $upstream_addr always;` | Mostra na resposta para qual backend a requisição foi |
-| `listen 127.0.0.1:8080` + `stub_status` | Status local para o exporter do `lb` |
+O `upstream` é o grupo de servidores de destino. Apontamos para a **porta 80**, que é a dos Nginx, e nunca para a 5000 da aplicação. Como nenhum algoritmo foi declarado, o Nginx usa o padrão, o **round robin**: um para cada lado, alternando.
 
-As três últimas preparam o **cenário 3** (falha de um backend): o cliente não deve ver erro quando A ou B cair.
+Além disso, já deixamos o balanceador preparado para quando um servidor cair:
+- `proxy_connect_timeout 2s`: se o backend não responder, desiste em 2 s. O padrão do Nginx seria 60 s.
+- `proxy_next_upstream error timeout http_502 http_503 http_504`: se um falhar, tenta **a mesma requisição** no outro.
+- `max_fails=1 fail_timeout=10s`: depois de uma falha, o servidor fica 10 s fora da rotação.
+- `add_header X-Upstream $upstream_addr`: a resposta conta para qual IP a requisição foi.
 
-### 6.1 Enviar o arquivo
+O `lb` também tem seu `stub_status` em `127.0.0.1:8080`, igual aos servidores.
+
+### Instalando
 
 🖥️ **PC**
 ```bash
@@ -623,121 +595,82 @@ mv ~/Downloads/lb.conf nginx/
 scp nginx/lb.conf ram@192.168.56.10:~/
 ```
 
-### 6.2 Instalar e ativar
-
 📦 **VM `lb`**
 ```bash
 sudo apt install -y nginx
 sudo mv ~/lb.conf /etc/nginx/sites-available/lb
 sudo ln -s /etc/nginx/sites-available/lb /etc/nginx/sites-enabled/
 sudo rm /etc/nginx/sites-enabled/default
-sudo nginx -t
-sudo systemctl reload nginx
-sudo ufw allow from 192.168.56.1 to any port 80 proto tcp    # porta 80 do lb só para o PC
-```
-
-### 6.3 Testar dentro do lb
-
-📦 **VM `lb`**
-```bash
+sudo nginx -t && sudo systemctl reload nginx
+sudo ufw allow from 192.168.56.1 to any port 80 proto tcp    # só o PC entra no balanceador
 curl http://127.0.0.1:8080/nginx_status
-ss -tlnp | grep -E ':80|:8080'
 ```
 
 ![Instalação e status no lb](docs/prints/lb-nginx-instalacao.png)
 
-`nginx -t` sem erros, regra do firewall adicionada, `stub_status` respondendo e as portas `0.0.0.0:80` (entrada) e `127.0.0.1:8080` (status) escutando.
-
-### 6.4 Demonstrar o round robin
+### O momento da verdade
 
 🖥️ **PC**
 ```bash
 for i in $(seq 6); do curl -s http://192.168.56.10/ | grep -o '"servidor": "[^"]*"'; done
 ```
-Saída esperada: uma resposta por linha, alternando.
 
 ![Round robin, uma resposta por linha](docs/prints/lb-round-robin-limpo.png)
 
-A sequência pode começar por A **ou** por B: o Nginx guarda a posição da rotação entre requisições, então a primeira desta rodada continua de onde a anterior parou. O que importa é a **alternância**.
+**A, B, A, B...** As respostas alternaram certinho. A sequência pode começar por A ou por B, porque o Nginx guarda a posição da rotação entre uma rodada e outra. O que importa é que elas alternam.
 
+Também olhamos os cabeçalhos:
 ```bash
-curl -i http://192.168.56.10/       # cabeçalhos: X-Upstream e X-Backend
+curl -i http://192.168.56.10/
 ```
 
 ![Round robin com cabeçalhos](docs/prints/lb-round-robin.png)
 
-- As 6 requisições alternaram **A, B, A, B, A, B**: o round robin funcionando.
-- `X-Upstream: 192.168.56.11:80` (colocado pelo `lb`) e `X-Backend: srv-a` (colocado pelo Nginx do `srv-a`) confirmam o caminho completo: **PC → lb → srv-a**.
+O `X-Upstream: 192.168.56.11:80` foi colocado pelo `lb`, e o `X-Backend: srv-a` pelo Nginx do servidor. Os dois juntos mostram o caminho inteiro: **PC → lb → srv-a**.
 
-### 6.5 Versionar
-
-🖥️ **PC**
-```bash
-git add .
-git commit -m "feat: Nginx balanceador com upstream round robin"
-git push
-```
+🖥️ **PC**: `git add . && git commit -m "feat: Nginx balanceador com round robin" && git push`
 
 ---
 
-## Etapa 7 — Exporters nas três VMs
+## Etapa 7 — Os exporters
 
-O Prometheus não entra nas VMs: ele **pergunta** periodicamente a cada exporter, por HTTP, e o exporter responde com as métricas em texto. São dois exporters por VM, totalizando os **6 alvos** que o Prometheus vai coletar.
+O Prometheus não entra nas VMs. Ele **pergunta**, e quem responde são os exporters: pequenos programas que traduzem o estado de alguma coisa para o "idioma" do Prometheus. Instalamos dois em cada VM, o que dá os **6 alvos** exigidos.
 
 ```
                       ┌─ :9100  Node Exporter  ──► CPU, memória, disco, carga, rede
 PC (Prometheus) ──────┤
-                      └─ :9113  Nginx Exporter ──► lê 127.0.0.1:8080/nginx_status
-                                                   e converte em métricas nginx_*
+                      └─ :9113  Nginx Exporter ──► lê o stub_status e vira métricas nginx_*
 ```
 
-| Exporter | Porta | Lê de | Métricas usadas no projeto |
-|----------|-------|-------|----------------------------|
-| Node Exporter | 9100 | O próprio Linux (`/proc`, `/sys`) | `node_cpu_seconds_total`, `node_memory_*`, `node_network_*`, `node_filesystem_*`, `node_load1` |
-| Nginx Prometheus Exporter | 9113 | `stub_status` do Nginx local | `nginx_up`, `nginx_http_requests_total`, `nginx_connections_*` |
+O **Node Exporter** fala sobre a máquina. O **Nginx Exporter** existe porque o `stub_status` é um texto simples que o Prometheus não entende; ele lê esse texto e o traduz.
 
-**Por que o Nginx Exporter existe:** o `stub_status` mostra um texto simples, que o Prometheus não entende. O exporter lê esse texto e o converte para o formato do Prometheus.
+Os dois vêm como pacotes do Ubuntu e já sobem como serviço. O Node Exporter funcionou sem mexer em nada. O Nginx Exporter precisou de um ajuste: ele procura o status em `/stub_status`, e o nosso fica em `/nginx_status`. A configuração ficou em `exporters/prometheus-nginx-exporter`:
 
-### A configuração
-
-Os dois exporters vêm como **pacotes do Ubuntu** e já sobem como serviço systemd. O Node Exporter funciona sem configuração. O Nginx Exporter precisa saber onde está o status, porque o padrão do pacote é `/stub_status` e o nosso endpoint é `/nginx_status`:
-
-`exporters/prometheus-nginx-exporter` → `/etc/default/prometheus-nginx-exporter`
 ```bash
 ARGS="--nginx.scrape-uri=http://127.0.0.1:8080/nginx_status --web.listen-address=:9113"
 ```
-| Opção | Para quê |
-|-------|----------|
-| `--nginx.scrape-uri` | Endereço do `stub_status` local que o exporter lê |
-| `--web.listen-address=:9113` | Porta em que o exporter publica as métricas |
 
-O arquivo `/etc/default/<serviço>` é onde o Ubuntu guarda os parâmetros dos serviços instalados por pacote: o systemd lê a variável `ARGS` e a passa ao programa.
-
-### 7.1 Enviar o arquivo para as três VMs
+### Instalando nas três VMs
 
 🖥️ **PC**
 ```bash
-mkdir -p exporters
-mv ~/Downloads/prometheus-nginx-exporter exporters/
+mkdir -p exporters && mv ~/Downloads/prometheus-nginx-exporter exporters/
 for ip in 10 11 12; do scp exporters/prometheus-nginx-exporter ram@192.168.56.$ip:~/; done
 ```
 
-### 7.2 Instalar
-
-📦 **VM `lb`**, 📦 **VM `srv-a`** e 📦 **VM `srv-b`** (comandos idênticos nas três)
+📦 **VM `lb`**, **`srv-a`** e **`srv-b`** (os mesmos comandos nas três)
 ```bash
 sudo apt install -y prometheus-node-exporter prometheus-nginx-exporter
 sudo mv ~/prometheus-nginx-exporter /etc/default/prometheus-nginx-exporter
-sudo systemctl restart prometheus-nginx-exporter                     # relê o ARGS novo
-sudo ufw allow from 192.168.56.1 to any port 9100,9113 proto tcp     # exporters só para o PC
+sudo systemctl restart prometheus-nginx-exporter
+sudo ufw allow from 192.168.56.1 to any port 9100,9113 proto tcp    # só o PC lê os exporters
 ```
 
-### 7.3 Testar dentro de cada VM
+### Testando dentro de cada VM
 
-📦 **VM `lb`**, 📦 **VM `srv-a`** e 📦 **VM `srv-b`**
 ```bash
-curl -s http://127.0.0.1:9100/metrics | grep "^node_load1"   # Node Exporter
-curl -s http://127.0.0.1:9113/metrics | grep "^nginx_up"     # Nginx Exporter
+curl -s http://127.0.0.1:9100/metrics | grep "^node_load1"
+curl -s http://127.0.0.1:9113/metrics | grep "^nginx_up"
 ss -tlnp | grep -E ':9100|:9113'
 ```
 
@@ -745,15 +678,9 @@ ss -tlnp | grep -E ':9100|:9113'
 ![Exporters no srv-a](docs/prints/exp-srv-a-local.png)
 ![Exporters no srv-b](docs/prints/exp-srv-b-local.png)
 
-| Saída | Significado |
-|-------|-------------|
-| `node_load1 1.25` / `node_load15 0.17` | Carga média do último 1 min e dos últimos 15 min (alta logo após a instalação, que acabou de rodar) |
-| `nginx_up 1` | O exporter conseguiu ler o `stub_status`. **0** = não conseguiu (caminho ou porta errados, ou Nginx parado) |
-| `*:9100` e `*:9113` | Exporters escutando em todas as interfaces; o firewall limita quem acessa |
+O `nginx_up 1` nas três VMs diz que o exporter conseguiu ler o status. Se viesse 0, o caminho estaria errado ou o Nginx estaria parado. O `node_load1` alto logo depois da instalação é normal: o `apt` tinha acabado de trabalhar.
 
-O `grep "^node_load1"` também mostra `node_load15`, porque começa com o mesmo texto.
-
-### 7.4 Testar do PC (como o Prometheus vai coletar)
+### Testando do PC, como o Prometheus fará
 
 🖥️ **PC**
 ```bash
@@ -766,61 +693,34 @@ done
 
 ![Os 6 alvos acessíveis a partir do PC](docs/prints/exp-pc-6-alvos.png)
 
-As três VMs responderam nas duas portas: são os **6 alvos** (3 Node Exporter + 3 Nginx Exporter), todos com `nginx_up 1`.
+Os seis responderam.
 
-### 7.5 Provar que só o PC acessa os exporters
+### E de outra VM?
 
-📦 **VM `lb`** (uma VM qualquer tentando ler o exporter de outra)
+📦 **VM `lb`**
 ```bash
-curl --max-time 3 http://192.168.56.11:9100/metrics
+curl --max-time 3 http://192.168.56.11:9100/metrics    # timeout
 ```
 
 ![lb bloqueado no exporter do srv-a](docs/prints/exp-lb-bloqueado.png)
 
-| Origem | Porta 9100/9113 das VMs | Por quê |
-|--------|-------------------------|---------|
-| 🖥️ PC (192.168.56.1) | ✅ responde | Regra `ufw allow from 192.168.56.1 to any port 9100,9113` |
-| 📦 `lb` (192.168.56.10) | ❌ timeout | Não está na regra: o firewall descarta |
+Bloqueado. Só o PC, onde roda o Prometheus, consegue ler os exporters, como pede o enunciado.
 
-Atende ao enunciado: *"Restringir o acesso às portas dos exporters ao computador que executa o Prometheus."*
-
-### 7.6 Versionar
-
-🖥️ **PC**
-```bash
-git add .
-git commit -m "feat: Node Exporter e Nginx Exporter nas três VMs"
-git push
-```
+🖥️ **PC**: `git add . && git commit -m "feat: exporters nas três VMs" && git push`
 
 ---
 
-## Etapa 8 — Prometheus no PC
+## Etapa 8 — Prometheus
 
-O Prometheus roda no **PC**, em Docker, e coleta a cada 5 s as métricas dos 6 exporters das VMs. O mesmo `docker-compose.yml` já sobe o Grafana, usado na etapa 9.
-
-```
-PC ─ Docker ─┬─ Prometheus (localhost:9090) ──coleta a cada 5 s──► 6 exporters nas VMs
-             └─ Grafana    (localhost:3000) ──consulta──► Prometheus
-```
-
-### Por que Docker
-
-- Nada instalado direto no PC: sobe e remove com um comando.
-- A configuração fica toda no repositório (`docker-compose.yml` + `prometheus.yml`): qualquer integrante do grupo reproduz o ambiente igual.
-- O enunciado permite: *"inclusive por contêiner se desejado"*.
+Rodamos o Prometheus no PC, dentro do **Docker**. Assim, nada precisou ser instalado direto no computador, e toda a configuração ficou no repositório: qualquer pessoa do grupo sobe o mesmo ambiente com um comando.
 
 ### O `docker-compose.yml`
 
-| Trecho | Para quê |
-|--------|----------|
-| `image: prom/prometheus` / `grafana/grafana-oss` | Imagens oficiais, edições gratuitas e open source |
-| `network_mode: host` | Containers usam a rede do PC: saem para as VMs com o IP `192.168.56.1`, o mesmo liberado no firewall dos exporters |
-| `./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro` | Usa a config do repositório, somente leitura (`ro`) |
-| `prometheus-data` / `grafana-data` | Volumes: métricas e dashboards sobrevivem a reinícios |
-| `--storage.tsdb.retention.time=15d` | Guarda 15 dias de histórico |
-| `--web.enable-lifecycle` | Permite recarregar a config sem reiniciar o container |
-| `restart: unless-stopped` | Sobe de novo sozinho após reiniciar o PC |
+Ele sobe o Prometheus (porta 9090) e o Grafana (porta 3000), que usamos na etapa seguinte. Algumas escolhas:
+- **Versões fixas** (`prom/prometheus:v3.15.0` e `grafana/grafana-oss:13.0.2`): quem subir isso daqui a um mês recebe exatamente as mesmas versões.
+- **`network_mode: host`**: os containers usam a rede do PC diretamente. Assim, o Prometheus chega às VMs com o IP `192.168.56.1`, o mesmo que liberamos no firewall dos exporters.
+- **Volumes**: as métricas e os dashboards sobrevivem quando o container reinicia.
+- **`restart: unless-stopped`**: tudo volta sozinho quando o PC liga, desde que o serviço do Docker esteja ativo (`sudo systemctl enable docker`).
 
 ### O `prometheus.yml`
 
@@ -828,157 +728,101 @@ PC ─ Docker ─┬─ Prometheus (localhost:9090) ──coleta a cada 5 s─�
 global:
   scrape_interval: 5s
 scrape_configs:
-  - job_name: node                      # 3 alvos na porta 9100
+  - job_name: node
     static_configs:
       - targets: ['192.168.56.10:9100']
         labels: { vm: lb, papel: balanceador }
       # ... srv-a (.11) e srv-b (.12)
-  - job_name: nginx                     # 3 alvos na porta 9113
-    # ... mesmos rótulos
+  - job_name: nginx
+    # ... as mesmas três VMs, na porta 9113
 ```
 
-| Item | Para quê |
-|------|----------|
-| `scrape_interval: 5s` | Coleta curta: os testes de carga aparecem quase em tempo real (o padrão é 1 min) |
-| `job_name: node` / `nginx` | Separa os alvos por tipo de exporter; vira o rótulo `job` |
-| `targets` | IP:porta de cada exporter |
-| `labels: vm, papel` | Rótulos próprios que distinguem **balanceador, servidor A e servidor B**, como pede o enunciado. Nos dashboards, filtra-se por `vm="srv-a"` em vez de decorar IPs |
+- **Coleta a cada 5 s:** o padrão do Prometheus é 1 minuto, lento demais para acompanhar um teste de carga.
+- **Dois jobs**, `node` e `nginx`, cada um com três alvos.
+- **Os rótulos `vm` e `papel`** distinguem balanceador, servidor A e servidor B, como pede o enunciado. Nos gráficos, isso nos deixa filtrar por `vm="srv-a"` em vez de decorar IPs.
 
-### 8.1 Subir os containers
-
-🖥️ **PC** (na pasta do repositório)
-```bash
-mkdir -p prometheus
-mv ~/Downloads/docker-compose.yml .
-mv ~/Downloads/prometheus.yml prometheus/
-docker compose up -d       # baixa as imagens e sobe em segundo plano
-docker compose ps          # os dois containers "Up"
-```
-
-![docker compose up](docs/prints/prom-compose-up.png)
-
-A coluna `PORTS` fica vazia por causa do `network_mode: host`: os containers não mapeiam portas, usam as do próprio PC.
-
-### 8.2 Conferir os 6 alvos
-
-🖥️ **PC** → navegador: **http://localhost:9090/targets** (*Status → Target health*)
-
-![Targets](docs/prints/prom-targets.png)
-
-- **nginx 3/3 up** e **node 3/3 up**: os 6 alvos coletando.
-- Cada alvo com `instance`, `job`, `papel` e `vm`.
-- *Last scrape* de poucos segundos atrás confirma a coleta a cada 5 s.
-
-### 8.3 Consulta `up`
-
-🖥️ **PC** → navegador: **http://localhost:9090/query** → digitar `up` → *Execute*
-
-![Consulta up](docs/prints/prom-query-up.png)
-
-`up` é uma métrica que o **próprio Prometheus** cria para cada alvo: **1** = a última coleta funcionou, **0** = falhou. As **6 séries com valor 1** comprovam todos os alvos UP.
-
-Pelo terminal:
-```bash
-curl -s localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"' | sort | uniq -c   # 6 "health":"up"
-```
-
-### 8.4 Versionar
-
-🖥️ **PC**
-```bash
-git add .
-git commit -m "feat: Prometheus com os 6 alvos via Docker Compose"
-git push
-```
-
----
-
-## Etapa 9 — Grafana e dashboards
-
-O Grafana (já subido pelo `docker-compose.yml`) consulta o Prometheus e mostra as métricas em **dois dashboards separados**, como exige o enunciado:
-
-| Dashboard | Fonte | Painéis |
-|-----------|-------|---------|
-| **Infraestrutura das VMs** | Node Exporter | Estado dos 6 alvos, CPU, memória, rede, carga (`node_load1`), disco |
-| **Nginx e tráfego HTTP** | Nginx Exporter | `nginx_up`, taxa de requisições, A × B, distribuição, conexões ativas, aceitas × processadas, leitura/escrita/espera |
-
-### Provisionamento: tudo como código
-
-Em vez de configurar o Grafana clicando, a fonte de dados e os dashboards ficam em arquivos no repositório e são **carregados automaticamente** quando o container sobe:
-
-| Arquivo | Para quê |
-|---------|----------|
-| `grafana/provisioning/datasources/prometheus.yml` | Cadastra o Prometheus (`http://localhost:9090`) como fonte de dados padrão |
-| `grafana/provisioning/dashboards/dashboards.yml` | Manda o Grafana ler os JSON da pasta `grafana/dashboards/` |
-| `grafana/dashboards/*.json` | Os dois dashboards. São também a **exportação em JSON** pedida na entrega |
-
-No `docker-compose.yml`, o serviço `grafana` monta essas pastas:
-```yaml
-volumes:
-  - ./grafana/provisioning:/etc/grafana/provisioning:ro
-  - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
-```
-
-**Vantagem:** qualquer integrante sobe o Grafana já configurado, com um comando. Se os dashboards forem editados pela interface, exportar de novo em *Share → Export → Save to file* e substituir o JSON na pasta.
-
-### 9.1 Subir e acessar
+### Subindo
 
 🖥️ **PC** (na pasta do repositório)
 ```bash
 docker compose up -d
+docker compose ps
 ```
-🖥️ **PC** → navegador: **http://localhost:3000** → usuário `admin`, senha `admin` (pede para trocar no primeiro acesso) → *Dashboards → Monitoramento Nginx*
+
+![docker compose up](docs/prints/prom-compose-up.png)
+
+A coluna `PORTS` aparece vazia por causa do `network_mode: host`. Os containers não mapeiam portas, usam direto as do PC.
+
+### Os seis alvos
+
+🖥️ **PC** → navegador: **http://localhost:9090/targets**
+
+![Targets](docs/prints/prom-targets.png)
+
+**nginx 3/3 up** e **node 3/3 up**, cada alvo com seus rótulos e coletado há poucos segundos.
+
+Na aba *Query*, a consulta `up` confirma a mesma coisa:
+
+![Consulta up](docs/prints/prom-query-up.png)
+
+`up` é uma métrica que o **próprio Prometheus** cria para cada alvo: vale 1 se a última coleta funcionou e 0 se falhou. Aqui foram seis 1.
+
+🖥️ **PC**: `git add . && git commit -m "feat: Prometheus com os 6 alvos" && git push`
+
+---
+
+## Etapa 9 — Grafana
+
+O Grafana subiu junto, pelo mesmo `docker-compose.yml`. Em vez de configurar tudo clicando, deixamos **a fonte de dados e os dashboards como arquivos** no repositório, que o Grafana carrega sozinho ao iniciar:
+
+- `grafana/provisioning/datasources/prometheus.yml` cadastra o Prometheus como fonte de dados.
+- `grafana/provisioning/dashboards/dashboards.yml` manda o Grafana ler a pasta de dashboards.
+- `grafana/dashboards/*.json` são os dois dashboards. Eles também são a **exportação em JSON** pedida na entrega.
+
+🖥️ **PC** → **http://localhost:3000** (usuário `admin`, senha `admin` no primeiro acesso) → *Dashboards → Monitoramento Nginx*
 
 ![Pasta com os dois dashboards](docs/prints/graf-pasta.png)
 
-### 9.2 Dashboard de infraestrutura
+### Dashboard 1: Infraestrutura das VMs
 
 ![Infraestrutura sem tráfego](docs/prints/graf-infra-base.png)
 ![Disco](docs/prints/graf-infra-disco.png)
 
-| Painel | Consulta PromQL | Unidade |
-|--------|-----------------|---------|
+| Painel | Consulta | Unidade |
+|--------|----------|---------|
 | Estado dos 6 alvos | `up` | UP/DOWN |
 | Uso de CPU | `100 * (1 - avg by (vm) (rate(node_cpu_seconds_total{mode="idle"}[1m])))` | % |
 | Memória utilizada | `100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)` | % |
-| Tráfego de rede | `rate(node_network_receive_bytes_total{device="enp0s8"}[1m])` e `..._transmit_...` | B/s |
+| Tráfego de rede | `rate(node_network_receive_bytes_total{device="enp0s8"}[1m])` e o equivalente de transmissão | B/s |
 | Carga média | `node_load1` | — |
-| Disco raiz | `node_filesystem_size_bytes{mountpoint="/"}` e `node_filesystem_avail_bytes{mountpoint="/"}` | bytes |
+| Disco | `node_filesystem_size_bytes` e `node_filesystem_avail_bytes` (em `/`) | bytes |
 
-### 9.3 Dashboard de Nginx e tráfego HTTP
+### Dashboard 2: Nginx e tráfego HTTP
 
 ![Nginx sem tráfego](docs/prints/graf-nginx-base.png)
 
-| Painel | Consulta PromQL | Unidade |
-|--------|-----------------|---------|
+| Painel | Consulta | Unidade |
+|--------|----------|---------|
 | Estado de cada Nginx | `nginx_up` | UP/DOWN |
 | Taxa de requisições | `rate(nginx_http_requests_total[1m])` | req/s |
-| Round robin A × B (mesmo painel) | `rate(nginx_http_requests_total{vm=~"srv-a\|srv-b"}[1m])` | req/s |
+| **A × B no mesmo painel** | `rate(nginx_http_requests_total{vm=~"srv-a\|srv-b"}[1m])` | req/s |
 | Distribuição no período | `round(sum by (vm) (increase(nginx_http_requests_total{vm=~"srv-a\|srv-b"}[$__range])))` | requisições |
 | Conexões ativas | `nginx_connections_active` | — |
 | Aceitas × processadas | `rate(nginx_connections_accepted[1m])` e `rate(nginx_connections_handled[1m])` | conexões/s |
-| Leitura / escrita / espera | `nginx_connections_reading`, `..._writing`, `..._waiting` | — |
+| Leitura, escrita, espera | `nginx_connections_reading`, `..._writing`, `..._waiting` | — |
 
-### Padrões adotados em todos os painéis
+### Os cuidados que tomamos
 
-- **Título, unidade, legenda e intervalo:** cada painel tem título descritivo, unidade (%, B/s, req/s...) e legenda em tabela com média, máximo e último valor. Intervalo padrão: últimos 15 min, atualização a cada 5 s.
-- **Contadores com `rate`:** métricas que só crescem (`*_total`, `accepted`, `handled`) são transformadas em taxa por segundo; métricas instantâneas (`node_load1`, `nginx_connections_active`) são usadas direto.
-- **Cores fixas por VM:** `lb` cinza, `srv-a` azul, `srv-b` laranja, em todos os painéis.
-- **Descrição em cada painel** (ícone ⓘ ao lado do título) explicando a consulta.
+- Todo painel tem **título, unidade e legenda** (com média, máximo e último valor). O intervalo padrão é de 15 minutos, atualizando a cada 5 segundos.
+- **Contadores ganharam `rate`.** Métricas que só crescem (`*_total`, `accepted`, `handled`) não dizem nada sobre "agora", então mostramos a variação por segundo. As que já são instantâneas (`node_load1`, conexões ativas, memória) foram usadas direto.
+- **Cada VM tem sempre a mesma cor:** `lb` cinza, `srv-a` azul, `srv-b` laranja.
+- **Cada painel tem uma descrição** (o ícone ⓘ) explicando a consulta.
 
-### 9.4 Linha de base (sem tráfego)
+### O mistério dos 0,2 req/s
 
-Mesmo sem ninguém acessando, os gráficos não ficam zerados:
+Mesmo sem ninguém acessando, os gráficos de requisições mostravam **0,2 req/s** em cada Nginx. Demoramos um pouco para entender: **é o próprio monitoramento**. O exporter lê o `stub_status` a cada 5 segundos, e cada leitura conta como uma requisição (1 ÷ 5 = 0,2). Da mesma forma, os ~4,8 kB/s na rede são os exporters respondendo ao Prometheus. Essa virou a nossa **linha de base**.
 
-| O que aparece | Por quê |
-|---------------|---------|
-| **0,2 req/s** em cada Nginx | O próprio monitoramento: o exporter lê o `stub_status` a cada 5 s, e cada leitura é uma requisição (1 ÷ 5 s = 0,2 req/s) |
-| ~4,8 kB/s transmitidos por VM | Os exporters respondendo às coletas do Prometheus |
-| CPU ~10%, memória ~24% | Consumo do sistema, do Nginx, da aplicação e dos exporters parados |
-
-Essa é a **linha de base** contra a qual os experimentos são comparados.
-
-### 9.5 Com tráfego
+### Com um pouco de tráfego
 
 🖥️ **PC**
 ```bash
@@ -988,95 +832,71 @@ for i in $(seq 200); do curl -s http://192.168.56.10/ > /dev/null; done
 ![Nginx com tráfego](docs/prints/graf-nginx-trafego.png)
 ![Infraestrutura com tráfego](docs/prints/graf-infra-trafego.png)
 
-| Nginx | Taxa | Leitura |
-|-------|------|---------|
-| `lb`    | 3,84 req/s | Todo o tráfego entra por ele (≈3,64) + 0,2 do exporter |
-| `srv-a` | 2,02 req/s | Metade (≈1,82) + 0,2 do exporter |
-| `srv-b` | 2,02 req/s | A outra metade (≈1,82) + 0,2 do exporter |
+Os números fecharam direitinho:
+- **`lb`: 3,84 req/s**, todo o tráfego (≈3,64) mais os 0,2 do exporter.
+- **`srv-a` e `srv-b`: 2,02 req/s cada**, metade do tráfego mais os 0,2.
+- **A pizza: 239 × 240 requisições**, um 50/50 praticamente perfeito.
 
-- **Distribuição: 239 × 240 requisições (50% / 50%).** Round robin praticamente perfeito.
-- **Conexões aceitas:** `lb` 3,64 c/s; A e B 1,82 c/s cada. Cada `curl` abre uma conexão nova, e o `lb` abre uma nova conexão com o backend a cada requisição; por isso a taxa de conexões acompanha a de requisições.
-- **Rede:** o `lb` recebe ~4,3 kB/s e cada backend ~1,2 kB/s; o tráfego se divide depois do balanceador.
+### Três consultas explicadas em detalhe
 
-### 9.6 Três consultas PromQL explicadas
+O enunciado pede que o grupo saiba explicar pelo menos três consultas. Estas são as nossas:
 
-O enunciado pede que o grupo saiba explicar a consulta de pelo menos três painéis.
-
-**1. Uso de CPU (%)**
+**1. Uso de CPU**
 ```promql
 100 * (1 - avg by (vm) (rate(node_cpu_seconds_total{mode="idle"}[1m])))
 ```
-- `node_cpu_seconds_total{mode="idle"}`: contador de segundos que cada núcleo passou **ocioso** desde o boot.
-- `rate(...[1m])`: quantos segundos ocioso **por segundo**, no último minuto. Dá um valor entre 0 e 1 (0,9 = 90% do tempo parado).
-- `avg by (vm)`: média dos núcleos de cada VM (aqui, 1 núcleo por VM), mantendo uma linha por VM.
-- `1 - ...`: inverte de ocioso para **ocupado**. `100 *`: em porcentagem.
+O `node_cpu_seconds_total{mode="idle"}` conta quantos segundos a CPU passou **parada** desde o boot. O `rate(...[1m])` transforma isso em "quantos segundos parada por segundo" no último minuto, um número entre 0 e 1. O `avg by (vm)` tira a média por máquina. O `1 -` inverte de "parada" para "ocupada", e o `100 *` converte para porcentagem.
 
-**2. Taxa de requisições por Nginx**
+**2. Taxa de requisições**
 ```promql
 rate(nginx_http_requests_total[1m])
 ```
-- `nginx_http_requests_total`: contador de requisições desde que o Nginx ligou; só cresce, então o valor bruto não diz nada sobre "agora".
-- `rate(...[1m])`: diferença do contador no último minuto dividida pelo tempo = **requisições por segundo**.
-- No painel A × B, o filtro `{vm=~"srv-a|srv-b"}` (`=~` = expressão regular) deixa só os backends, para comparar o round robin.
+O contador de requisições só cresce desde que o Nginx ligou; sozinho, ele não diz nada sobre agora. O `rate` pega quanto ele cresceu no último minuto e divide pelo tempo: **requisições por segundo**. No painel A × B, o filtro `{vm=~"srv-a|srv-b"}` deixa só os dois servidores, para compará-los lado a lado.
 
-**3. Memória utilizada (%)**
+**3. Memória utilizada**
 ```promql
 100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
 ```
-- `MemAvailable`: memória que ainda pode ser usada sem recorrer a swap (inclui cache que pode ser liberado). `MemTotal`: memória total.
-- `disponível / total`: fração livre. `1 - ...`: fração usada. `100 *`: porcentagem.
-- São *gauges* (valores instantâneos), por isso não precisam de `rate`.
+Disponível dividido por total dá a fração livre; `1 -` dá a fração usada; vezes 100, a porcentagem. Aqui não entra `rate`, porque essas métricas já são o valor do momento.
 
-### 9.7 Versionar
-
-🖥️ **PC**
-```bash
-git add .
-git commit -m "feat: Grafana com dashboards provisionados"
-git push
-```
+🖥️ **PC**: `git add . && git commit -m "feat: Grafana com dashboards provisionados" && git push`
 
 ---
 
-## Etapa 10 — Experimentos
+## Etapa 10 — Os experimentos
 
-### Ferramenta de carga
+Com tudo montado, era hora de colocar o ambiente à prova.
 
-**`hey`** (gerador de carga HTTP), rodando no **PC** em Docker. O pacote do AUR (`hey-bin`) estava quebrado (download com erro 403), então foi usada a imagem Docker:
+### A ferramenta: `hey`
+
+Usamos o **`hey`**, um gerador de carga HTTP, rodando no PC. O pacote do Arch estava quebrado, então usamos a versão em Docker:
 
 🖥️ **PC**
 ```bash
-alias hey='docker run --rm --network host williamyeh/hey'   # vale para o terminal atual
-hey -n 20 -c 5 http://192.168.56.10/                         # teste rápido
+alias hey='docker run --rm --network host williamyeh/hey'
+hey -n 20 -c 5 http://192.168.56.10/
 ```
-- `--network host`: o tráfego sai pelo PC (`192.168.56.1`), o IP liberado no firewall do `lb`.
-- Nesta versão do `hey`, o total (`-n`) não pode ser menor que a concorrência (`-c`, padrão 50).
-
-| Opção do `hey` | Significado |
-|----------------|-------------|
-| `-z 3m` | Duração do teste |
-| `-c 5` | Concorrência: clientes simultâneos |
-| `-q 4` | Limite de requisições por segundo **por cliente** (5 × 4 = 20 req/s no total) |
-| `-n 20` | Total de requisições (quando não se usa `-z`) |
-
-**Como ler o resumo do `hey`:** `Requests/sec` = vazão; `Average` / `Slowest` = latência média e pior caso; `95% in` = 95% das requisições responderam até esse tempo; `Status code distribution` = códigos HTTP (`[200]` = sucesso). O `hey` mede a **latência**, que o `stub_status` do Nginx não fornece.
 
 ![Teste do hey](docs/prints/exp0-hey-teste.png)
 
-### Resumo dos cenários
+As opções que usamos: `-z` (duração), `-c` (quantos clientes simultâneos) e `-q` (limite de requisições por segundo **por cliente**). No resumo, o que mais olhamos foi a vazão (`Requests/sec`), a latência média (`Average`), o percentil 95 (`95% in`: 95% das requisições responderam até esse tempo) e os códigos de resposta (`[200]` = sucesso).
 
-| # | Cenário | Rota | Duração | Concorrência | Taxa |
-|---|---------|------|---------|--------------|------|
-| 1 | Funcionamento normal | `/` | 3 min | 5 | 20 req/s (limitada com `-q 4`) |
-| 2 | Aumento de carga | `/carga?n=50000` | 4 × 1 min | 2 → 5 → 10 → 20 | Sem limite |
-| 3 | Falha de um backend | `/` | 3 min | 5 | 20 req/s; Nginx do `srv-a` parado por ~45 s |
-| 4 | Estratégia alternativa | `/carga?n=50000` | 2 min | 5 | Sem limite; `weight=3` no `srv-a` |
+Um bônus: o `hey` mede a **latência**, que o `stub_status` do Nginx não fornece.
+
+### Os quatro cenários
+
+| # | Cenário | Rota | Duração | Clientes | Taxa |
+|---|---------|------|---------|----------|------|
+| 1 | Funcionamento normal | `/` | 3 min | 5 | 20 req/s |
+| 2 | Aumento de carga | `/carga?n=50000` | 4 × 1 min | 2 → 5 → 10 → 20 | sem limite |
+| 3 | Falha de um backend | `/` | 3 min | 5 | 20 req/s, com o `srv-a` parado por ~45 s |
+| 4 | Estratégia alternativa | `/carga?n=50000` | 2 min | 5 | sem limite, com peso 3 no `srv-a` |
 
 ---
 
 ### Cenário 1 — Funcionamento normal
 
-**Objetivo:** mostrar a alternância e uma distribuição compatível com round robin sob carga moderada.
+**A pergunta:** com uma carga tranquila, o round robin divide mesmo meio a meio?
 
 🖥️ **PC**
 ```bash
@@ -1087,26 +907,20 @@ hey -z 3m -c 5 -q 4 http://192.168.56.10/
 ![Cenário 1: conexões](docs/prints/exp1-conexoes.png)
 ![Cenário 1: infraestrutura](docs/prints/exp1-infra.png)
 
-| Medida | Resultado |
-|--------|-----------|
-| Requisições | 3600, todas **200** (0 erros) |
-| Vazão | 20,0 req/s |
-| Latência | média 5,6 ms · p95 7,6 ms · p99 9,5 ms |
-| Taxa por Nginx | `lb` ~20 req/s · `srv-a` ~10 · `srv-b` ~10 |
-| Distribuição | **50% / 50%** |
-| CPU | ~9–12% nas três VMs (≈ linha de base de 10%) |
-| Rede | `lb` até 17,7 kB/s recebidos; A e B ~5,8 kB/s cada |
+**O que vimos:**
+- **3600 requisições, nenhuma com erro**, a 20 req/s. Latência média de 5,6 ms, e 99% abaixo de 9,5 ms.
+- O `lb` recebeu ~20 req/s, e **cada servidor ~10**. A pizza fechou em **50% / 50%**.
+- A CPU mal se mexeu (~9–12%, quase a linha de base). Para esse ambiente, é uma carga leve.
 
-**Interpretação:**
-- O round robin dividiu o tráfego **igualmente**: cada backend recebeu metade.
-- Carga **leve** para o ambiente: a CPU quase não saiu da linha de base, e a latência ficou abaixo de 10 ms.
-- **Conexões:** o `lb` tem 6 conexões ativas (as 5 do `hey`, reaproveitadas com keep-alive, + 1 do exporter), e a taxa de conexões aceitas nele fica perto de zero. Já em A e B, as conexões aceitas acompanham as requisições (~10 c/s): **o `lb` abre uma conexão nova com o backend a cada requisição** (ver [melhorias](#melhorias-possíveis)).
+**Um detalhe curioso nas conexões:** o `hey` reaproveita as próprias 5 conexões (keep-alive), por isso o `lb` quase não abre conexões novas. Já A e B recebem ~10 conexões novas por segundo, uma por requisição. Ou seja, **o `lb` abre uma conexão nova com o servidor a cada requisição**. Isso entrou na lista de melhorias.
 
 ---
 
 ### Cenário 2 — Aumento de carga
 
-**Objetivo:** elevar a concorrência aos poucos e observar requisições, conexões, CPU e rede. Usa a rota `/carga`, que gasta CPU de propósito (~40 ms por requisição).
+**A pergunta:** o que acontece quando apertamos de verdade?
+
+Aqui usamos a rota `/carga`, que gasta ~40 ms de CPU por requisição, e fomos dobrando o número de clientes a cada minuto.
 
 🖥️ **PC**
 ```bash
@@ -1116,53 +930,61 @@ for c in 2 5 10 20; do
 done
 ```
 
-![Cenário 2: saída do hey (c = 2, 5, 10)](docs/prints/exp2-infra-parcial.png)
-![Cenário 2: saída do hey (c = 20)](docs/prints/exp2-hey-c20.png)
+![Cenário 2: saída do hey (2, 5 e 10 clientes)](docs/prints/exp2-infra-parcial.png)
+![Cenário 2: saída do hey (20 clientes)](docs/prints/exp2-hey-c20.png)
 ![Cenário 2: Nginx](docs/prints/exp2-nginx-parcial.png)
 ![Cenários 2 e 3: infraestrutura](docs/prints/exp2-3-infra.png)
 
-| Concorrência | Vazão | Latência média | p95 | Erros |
-|--------------|-------|----------------|-----|-------|
+| Clientes | Vazão | Latência média | p95 | Erros |
+|----------|-------|----------------|-----|-------|
 | 2  | 52,7 req/s | 38 ms  | 83 ms  | 0 |
 | 5  | 53,5 req/s | 93 ms  | 211 ms | 0 |
 | 10 | 52,6 req/s | 190 ms | 409 ms | 0 |
 | 20 | 50,7 req/s | 390 ms | 1,40 s | 0 |
 
-| Componente | Comportamento |
-|------------|---------------|
-| CPU de A e B | Sobe de ~10% para **~97–98%** e fica lá |
-| CPU do `lb` | ~12% (máx. 16,5%) |
-| `node_load1` de A e B | Até ~1,9 (fila esperando a única vCPU) |
-| Requisições | ~26–27 req/s por backend; distribuição 50% / 50% |
-| Conexões ativas / em escrita | Crescem com a concorrência (até ~20 por Nginx) |
-| Rede | `lb` até ~46 kB/s recebidos e ~61 kB/s transmitidos |
+**O que vimos:** os servidores **saturaram já com 2 clientes**. A CPU de A e B foi a ~98% e ficou lá, e a vazão travou em ~53 req/s, uns 26 por servidor.
 
-**Interpretação:**
-- **Os backends saturam já com 2 clientes.** Cada requisição gasta ~40 ms de CPU e cada VM tem 1 vCPU, então cada backend aguenta ~26 req/s, e os dois juntos ~53 req/s.
-- A partir daí, **mais clientes não aumentam a vazão, só aumentam a fila**: a latência dobra a cada vez que a concorrência dobra. Os números seguem a relação **latência ≈ clientes ÷ vazão** (Lei de Little): 2/52,7 = 38 ms · 5/53,5 = 93 ms · 10/52,6 = 190 ms · 20/50,7 = 395 ms.
-- Com 20 clientes, a vazão chega a **cair um pouco** (a CPU gasta tempo alternando entre processos) e a cauda da latência dispara (p95 de 1,4 s, máximo ~4,4 s).
-- **O gargalo são os backends, não o balanceador:** o `lb` ficou com ~12% de CPU.
-- Mesmo saturado, o sistema **não perdeu nenhuma requisição**: ficou lento, mas não falhou.
+A partir daí, colocar mais clientes **não aumentou a vazão, só aumentou a fila**: a latência dobrava toda vez que dobrávamos os clientes. Dá até para conferir com uma conta simples (é a chamada Lei de Little), **latência ≈ clientes ÷ vazão**:
+- 2 ÷ 52,7 = 38 ms
+- 5 ÷ 53,5 = 93 ms
+- 10 ÷ 52,6 = 190 ms
+- 20 ÷ 50,7 = 395 ms
+
+Os números batem com o que o `hey` mediu.
+
+Com 20 clientes, a vazão chegou a cair um pouco (a CPU passa a gastar tempo alternando entre os processos), e o pior caso disparou: o p95 foi a 1,4 s e o máximo a ~4,4 s.
+
+Outros sinais nos gráficos:
+- O `node_load1` de A e B chegou a ~1,9: processos na fila esperando a única CPU.
+- As conexões em escrita subiram junto com os clientes: o Nginx fica esperando a aplicação responder.
+- A distribuição continuou 50/50 mesmo sob pressão.
+- **O `lb` ficou com só ~12% de CPU.** O gargalo eram os servidores, não o balanceador.
+
+E o mais importante: **nenhuma requisição falhou**. O sistema ficou lento, mas não quebrou.
 
 ---
 
 ### Cenário 3 — Falha de um backend
 
-**Objetivo:** interromper o servidor A durante a carga, observar o impacto e a recuperação.
+**A pergunta:** e se um servidor cair no meio do caminho?
 
-**Terminal 1, 🖥️ PC**
+Rodamos uma carga tranquila e, no meio dela, desligamos o Nginx do `srv-a`. Uns 45 segundos depois, religamos.
+
+🖥️ **PC** (terminal 1)
 ```bash
 date; hey -z 3m -c 5 -q 4 http://192.168.56.10/
 ```
-**Terminal 2, 📦 VM `srv-a`** (com o `hey` rodando)
+📦 **VM `srv-a`** (terminal 2, com o `hey` rodando)
 ```bash
-date; sudo systemctl stop nginx     # ~1 min depois do início
-date; sudo systemctl start nginx    # ~45 s depois
+date; sudo systemctl stop nginx
+date; sudo systemctl start nginx
 ```
 
 ![Cenário 3: parada e retorno do Nginx do srv-a](docs/prints/exp3-parada.png)
 
-**Depois do teste, 📦 VM `lb`**
+Depois, fomos ver o que o balanceador anotou:
+
+📦 **VM `lb`**
 ```bash
 sudo grep -c "Connection refused" /var/log/nginx/error.log
 sudo tail -3 /var/log/nginx/error.log
@@ -1171,33 +993,29 @@ sudo tail -3 /var/log/nginx/error.log
 ![Cenário 3: resumo do hey e log do lb](docs/prints/exp3-hey-log.png)
 ![Cenário 3: Nginx](docs/prints/exp3-nginx.png)
 
-| Medida | Resultado |
-|--------|-----------|
-| Requisições | 3600, todas **200**: **nenhum erro chegou ao cliente** |
-| Latência | média 6,2 ms · p99 10,9 ms · máximo 50,6 ms |
-| Log do `lb` | **5** × `connect() failed (111: Connection refused) while connecting to upstream`, às 02:39:53, 02:40:04 e 02:40:15 (~11 s de intervalo) |
-| Taxa por Nginx | `lb` constante em ~20 req/s; `srv-b` sobe até **18,2 req/s**; `srv-a` cai e depois volta |
-| Distribuição no período | 37% A / 63% B |
-| `nginx_up` do `srv-a` | 0 enquanto o Nginx estava parado; 1 após o retorno |
+**O que vimos:** **3600 requisições, todas com sucesso.** O cliente não percebeu nada; no máximo, algumas respostas levaram 50 ms em vez de 6.
 
-**Interpretação (comportamento do Nginx):**
-1. **Detecção:** ao tentar o A, o `lb` recebe *Connection refused* imediatamente (nada escuta na porta 80).
-2. **Desvio:** com `proxy_next_upstream error`, a **mesma requisição** é reenviada ao B. O cliente recebe 200, só alguns milissegundos mais tarde (o máximo de 50 ms).
-3. **Exclusão temporária:** com `max_fails=1 fail_timeout=10s`, o A fica 10 s fora da rotação. O log mostra exatamente isso: tentativas a cada ~11 s, só **5 falhas** em ~45 s de queda.
-4. **Recuperação:** quando o A volta, a próxima tentativa funciona e a distribuição retorna a 50/50 sem nenhuma intervenção.
+O B assumiu o tráfego, subindo até 18 req/s, enquanto o `lb` seguiu firme nos 20. Quando o A voltou, a distribuição se reequilibrou sozinha. No período inteiro, a pizza ficou em 37% A / 63% B.
 
-**Observações:**
-- A linha do A **não chega a zero** e desce em "V": o `rate(...[1m])` é a média do último minuto, e a queda real durou só 45 s. Uma janela menor (`[15s]`) mostraria a queda mais nítida.
-- O painel `nginx_up` mostra o **último** valor; durante a queda ele ficou em 0 (DOWN).
-- Os horários do log das VMs estão **~3–4 min atrasados** em relação ao PC (as VMs não sincronizam o relógio). Os gráficos não são afetados, porque usam o horário do Prometheus, que roda no PC.
+O log do `lb` contou a história com detalhes. Foram só **5 falhas** em ~45 s, espaçadas de **~11 segundos** (02:39:53, 02:40:04, 02:40:15...). O processo foi este:
+1. O `lb` tentou o A e recebeu *Connection refused*: não havia ninguém na porta 80.
+2. Na hora, reenviou **a mesma requisição** para o B (`proxy_next_upstream`). Por isso o cliente recebeu 200.
+3. Tirou o A da rotação por 10 segundos (`fail_timeout=10s`).
+4. Passados os 10 segundos, tentou o A de novo. Enquanto ele estava fora, falhou de novo e voltou ao passo 3. Quando ele voltou, funcionou, e tudo voltou ao normal.
+
+**Duas observações honestas:**
+- No gráfico, a linha do A **não chega a zero**; ela desce em "V". O motivo é que o `rate(...[1m])` faz a média do último minuto, e a queda durou só 45 s. Uma janela menor mostraria a queda mais nítida.
+- Os horários do log das VMs estavam uns 3–4 minutos **atrasados** em relação ao PC, porque as VMs não sincronizam o relógio. Os gráficos não foram afetados, porque usam o horário do Prometheus, que roda no PC.
 
 ---
 
 ### Cenário 4 — Estratégia alternativa: pesos
 
-**Objetivo:** alterar o algoritmo e comparar com o round robin. Foi dado **peso 3 ao servidor A** (A recebe 3 de cada 4 requisições) e repetida a carga do Cenário 2 com concorrência 5.
+**A pergunta:** e se mudarmos a regra de distribuição?
 
-**📦 VM `lb`:** em `/etc/nginx/sites-available/lb`, na linha do `srv-a`:
+Demos **peso 3** ao servidor A, para ele receber 3 de cada 4 requisições, e repetimos a carga do Cenário 2 com 5 clientes, para comparar com o round robin.
+
+📦 **VM `lb`**: em `/etc/nginx/sites-available/lb`, na linha do `srv-a`:
 ```nginx
 server 192.168.56.11:80 weight=3 max_fails=1 fail_timeout=10s;
 ```
@@ -1217,318 +1035,172 @@ hey -z 2m -c 5 "http://192.168.56.10/carga?n=50000"
 ![Cenário 4: Nginx](docs/prints/exp4-nginx.png)
 ![Cenário 4: infraestrutura](docs/prints/exp4-infra.png)
 
-Depois do teste, o `weight=3` foi removido e o Nginx recarregado (volta ao round robin):
+Ao terminar, tiramos o `weight=3` e voltamos para o round robin:
 
 ![Cenário 4: configuração revertida](docs/prints/exp4-revertido.png)
 
-**Comparação com o round robin (mesma carga: `/carga`, concorrência 5):**
+| | Round robin | Peso 3:1 |
+|--|-------------|----------|
+| Distribuição | 50% / 50% | **74% A / 26% B** |
+| Vazão | 53,5 req/s | **40,8 req/s (−24%)** |
+| Latência média | 93 ms | **122 ms (+31%)** |
+| CPU do A | ~97% | **100%** |
+| CPU do B | ~97% | **até 41%** |
+| Erros | 0 | 0 |
 
-| Medida | Round robin (Cenário 2, c=5) | Peso 3:1 (Cenário 4) | Diferença |
-|--------|------------------------------|----------------------|-----------|
-| Distribuição | 50% / 50% | **74% A / 26% B** | — |
-| Vazão total | 53,5 req/s | **40,8 req/s** | **−24%** |
-| Latência média | 93 ms | **122 ms** | **+31%** |
-| p95 | 211 ms | 213 ms | ≈ |
-| CPU do A | ~97% | **100%** | — |
-| CPU do B | ~97% | **até 41%** | B ocioso |
-| `node_load1` | A e B ~1,9 | A 1,17 · B 0,47 | — |
-| Erros | 0 | 0 | — |
+**O que vimos:** o peso funcionou (A, B, A, A, A, B... e a pizza em 74/26), mas **piorou o resultado**. O A saturou, enquanto o B passou mais da metade do tempo parado. A vazão total ficou limitada pelo que um único servidor aguenta.
 
-**Interpretação:**
-- O peso funcionou: a sequência mostra o padrão **A, B, A, A, A, B, A...** e a pizza ficou em **74/26**, perto dos 75/25 esperados.
-- **Com servidores iguais, o peso piorou o resultado.** O A saturou (100% de CPU, ~31 req/s, seu limite) enquanto o B ficou mais da metade do tempo ocioso. A vazão total caiu 24%, porque o sistema passou a ser limitado só pela capacidade do A.
-- **Quando o peso faz sentido:** com servidores **diferentes**, por exemplo um com 3 vCPUs e outro com 1. Aí o peso proporcional à capacidade equilibra a carga real.
-- **Conclusão:** para A e B idênticos, o **round robin** é a escolha certa. Outra alternativa seria `least_conn` (envia para quem tem menos conexões abertas), que se adapta sozinho quando um servidor fica lento.
+**A lição:** peso faz sentido quando os servidores são **diferentes**, por exemplo um com 3 CPUs e outro com 1. Com servidores iguais, como os nossos, o round robin é a escolha certa. Se quiséssemos algo que se adaptasse sozinho, o `least_conn` (manda para quem tem menos conexões abertas) seria a próxima tentativa.
 
 ---
 
-## Análise: resultados, limitações e melhorias
+## O que aprendemos: resultados, limitações e melhorias
 
 ### Resultados
 
-| Cenário | O que se esperava | O que aconteceu |
+| Cenário | O que esperávamos | O que aconteceu |
 |---------|-------------------|-----------------|
-| 1. Normal | Alternância e distribuição de round robin | 50% / 50%, 0 erros, latência < 10 ms |
-| 2. Aumento de carga | Mudanças em requisições, conexões, CPU e rede | Saturação de CPU em A e B (~98%) a ~53 req/s; latência crescendo proporcionalmente à concorrência; `lb` folgado |
-| 3. Falha de backend | Impacto, comportamento do Nginx e recuperação | B absorveu todo o tráfego, 0 erros para o cliente, A excluído por 10 s a cada falha, recuperação automática |
-| 4. Estratégia alternativa | Comparação justificada | Peso 3:1 levou a 74/26, −24% de vazão e +31% de latência: pior para servidores iguais |
+| 1. Normal | Alternância e divisão por igual | 50/50, nenhum erro, latência abaixo de 10 ms |
+| 2. Aumento de carga | Ver requisições, conexões, CPU e rede reagirem | Servidores saturados a ~53 req/s, latência crescendo junto com os clientes, `lb` folgado |
+| 3. Falha | Ver o impacto e a recuperação | O B absorveu tudo, nenhum erro para o cliente, recuperação automática |
+| 4. Pesos | Comparar com o round robin | Pior para servidores iguais: −24% de vazão, +31% de latência |
 
-### Limitações
+### Limitações que reconhecemos
 
-- **`stub_status` não mostra códigos HTTP, latência nem qual backend respondeu.** A latência veio do `hey`, e o backend aparece só nos cabeçalhos (`X-Upstream`, `X-Backend`), não no Prometheus.
-- **Linha de base de 0,2 req/s:** as leituras do próprio exporter contam como requisições no Nginx.
-- **`rate(...[1m])` suaviza eventos curtos:** a queda de 45 s do Cenário 3 aparece como um "V", sem chegar a zero.
-- **Verificação passiva de saúde:** o Nginx Open Source só descobre que um backend caiu quando uma requisição real falha; não há *health check* ativo (recurso do Nginx Plus).
-- **Sem keep-alive entre o `lb` e os backends:** uma conexão TCP nova por requisição (visível em "conexões aceitas" de A e B).
-- **Relógios das VMs dessincronizados** (~3–4 min), o que dificulta cruzar logs.
-- **Ambiente num único computador:** VMs, Prometheus, Grafana e gerador de carga disputam o mesmo hardware, o que pode influenciar os números.
-- **Aplicação com 1 processo Python por VM:** não aproveitaria mais de um núcleo.
+- O `stub_status` não informa latência, códigos HTTP nem qual servidor respondeu. A latência veio do `hey`, e o servidor só aparece nos cabeçalhos da resposta.
+- As leituras do próprio exporter aparecem como requisições (a linha de base de 0,2 req/s).
+- A média de 1 minuto do `rate` suaviza eventos curtos, como a queda de 45 s.
+- O Nginx Open Source só descobre que um servidor caiu quando uma requisição real falha; não existe uma verificação de saúde ativa (isso é recurso do Nginx Plus).
+- O `lb` abre uma conexão nova com o servidor a cada requisição.
+- Os relógios das VMs estão dessincronizados, o que complica cruzar logs.
+- Tudo roda num único computador: VMs, Prometheus, Grafana e o gerador de carga disputam o mesmo hardware.
+- A aplicação é um único processo Python por VM.
 
-### Melhorias possíveis
+### O que faríamos a seguir
 
-| Melhoria | Como | Benefício |
-|----------|------|-----------|
-| Keep-alive no upstream | `keepalive 16;` no `upstream` + `proxy_http_version 1.1;` e `proxy_set_header Connection "";` | Reaproveita conexões `lb` → backend; menos latência e CPU |
-| Latência e códigos HTTP no Prometheus | Log do Nginx com `$upstream_response_time` e `$status` + exportador de logs, ou métricas na própria aplicação | Painéis de latência, erros por classe e falhas por upstream |
-| Janela menor no `rate` | `[15s]` ou `$__rate_interval` | Eventos curtos aparecem com nitidez |
-| Alertas | Regras do Prometheus/Grafana para `up == 0`, `nginx_up == 0`, CPU > 90% | Aviso automático em vez de olhar o painel |
-| Sincronizar relógios | `timedatectl set-ntp true` nas VMs | Logs comparáveis entre máquinas |
-| `least_conn` | `least_conn;` no `upstream` | Adapta-se a backends de velocidades diferentes |
-| Escalar a aplicação | Mais vCPUs e mais processos (ex.: Gunicorn com vários *workers*) ou um terceiro backend | Mais vazão antes da saturação |
-
----
-
-## Roteiro de demonstração ao professor
-
-Ordem sugerida, com tudo ligado. Cada linha diz **onde** rodar e **o que dizer**.
-
-### A. Infraestrutura
-
-| # | Onde rodar | Comando | Mostrar / explicar |
-|---|------------|---------|--------------------|
-| 1 | 🧰 VirtualBox | *Settings → Network* de uma VM | Duas placas: NAT (internet) e host-only (rede do projeto) |
-| 2 | 🖥️ PC | `ip -4 addr` | O PC tem `192.168.56.1` na placa host-only: é por ela que o Prometheus vai coletar |
-| 3 | 🖥️ PC | `ping -c 2 192.168.56.10` (e `.11`, `.12`) | O PC alcança as três VMs |
-| 4 | 📦 VM `srv-a` | `ping -c 2 192.168.56.10` e `.12` | As VMs se comunicam entre si; `ttl=64` = mesma rede |
-| 5 | 📦 qualquer VM | `hostnamectl` | Hostname e versão do sistema |
-| 6 | 📦 qualquer VM | `ip -4 addr show enp0s8` | IP fixo (`valid_lft forever`) |
-| 7 | 📦 qualquer VM | `sudo ufw status verbose` | Entrada bloqueada por padrão; só o necessário liberado |
-
-### B. Aplicação
-
-| # | Onde rodar | Comando | Mostrar / explicar |
-|---|------------|---------|--------------------|
-| 8  | 📦 VM `srv-a` | `curl http://127.0.0.1:5000/` | Responde "Servidor A" com data e hora |
-| 9  | 📦 VM `srv-b` | `curl http://127.0.0.1:5000/` | Responde "Servidor B" (mesmo código, outra variável) |
-| 10 | 📦 VM `srv-a` | `curl http://127.0.0.1:5000/health` | Rota de saúde |
-| 11 | 📦 VM `srv-a` | `curl "http://127.0.0.1:5000/carga?n=1000000"` | Tempo maior que no `/`: a rota gera carga de CPU controlada |
-| 12 | 📦 VM `srv-a` | `ss -tlnp \| grep 5000` | Escuta só em `127.0.0.1` |
-| 13 | 🖥️ **PC** | `curl --max-time 3 http://192.168.56.11:5000/` | **Falha** (timeout): a porta interna não é acessível pela rede |
-| 14 | 📦 VM `srv-a` | `systemctl status app --no-pager` | Roda como serviço: sobe no boot, religa se cair |
-
-### C. Nginx nos servidores
-
-| # | Onde rodar | Comando | Mostrar / explicar |
-|---|------------|---------|--------------------|
-| 15 | 📦 VM `srv-a` | `cat /etc/nginx/sites-available/backend` | `proxy_pass` para `127.0.0.1:5000`, cabeçalhos preservados, `stub_status` em `127.0.0.1:8080` |
-| 16 | 📦 VM `srv-a` | `curl -i http://127.0.0.1/` | `Server: nginx` e `X-Backend: srv-a`: passou pelo Nginx até a aplicação |
-| 17 | 📦 VM `srv-a` | `curl http://127.0.0.1:8080/nginx_status` | Contadores que o exporter vai ler |
-| 18 | 📦 VM `lb` | `curl http://192.168.56.11/` e `.12/` | O balanceador alcança os dois backends |
-| 19 | 🖥️ **PC** | `curl --max-time 3 http://192.168.56.11/` | **Timeout**: só o `lb` pode acessar os backends |
-| 20 | 📦 VM `srv-a` | `sudo ufw status` | Regra da porta 80 restrita a `192.168.56.10` |
-
-### D. Balanceamento
-
-| # | Onde rodar | Comando | Mostrar / explicar |
-|---|------------|---------|--------------------|
-| 21 | 📦 VM `lb` | `cat /etc/nginx/sites-available/lb` | `upstream` apontando para a porta **80** dos Nginx de A e B (não para a 5000); sem algoritmo = round robin |
-| 22 | 🖥️ **PC** | `for i in $(seq 6); do curl -s http://192.168.56.10/ \| grep -o '"servidor": "[^"]*"'; done` | Respostas alternando A, B, A, B... |
-| 23 | 🖥️ **PC** | `curl -i http://192.168.56.10/` | `X-Upstream` (escolha do lb) e `X-Backend` (quem respondeu) |
-| 24 | 📦 VM `lb` | `curl http://127.0.0.1:8080/nginx_status` | Status do balanceador; os contadores sobem a cada requisição |
-
-### E. Exporters
-
-| # | Onde rodar | Comando | Mostrar / explicar |
-|---|------------|---------|--------------------|
-| 25 | 📦 VM `srv-a` | `cat /etc/default/prometheus-nginx-exporter` | O exporter lê o `stub_status` local em `127.0.0.1:8080/nginx_status` |
-| 26 | 📦 VM `srv-a` | `curl -s http://127.0.0.1:9113/metrics \| grep "^nginx_"` | O texto do `stub_status` convertido em métricas `nginx_*` |
-| 27 | 🖥️ **PC** | o `for` da etapa 7.4 | Os 6 alvos respondendo |
-| 28 | 📦 VM `lb` | `curl --max-time 3 http://192.168.56.11:9100/metrics` | **Timeout**: só o PC acessa os exporters |
-| 29 | 📦 qualquer VM | `sudo ufw status` | Portas 9100 e 9113 liberadas só para `192.168.56.1` |
-
-### F. Prometheus
-
-| # | Onde rodar | Comando / ação | Mostrar / explicar |
-|---|------------|----------------|--------------------|
-| 30 | 🖥️ PC | `docker compose ps` | Prometheus e Grafana rodando em containers |
-| 31 | 🖥️ PC | `cat prometheus/prometheus.yml` | 2 jobs × 3 alvos, rótulos `vm` e `papel`, coleta a cada 5 s |
-| 32 | 🖥️ PC (navegador) | `localhost:9090/targets` | **6 alvos UP** |
-| 33 | 🖥️ PC (navegador) | consulta `up` | 6 séries com valor 1 |
-| 34 | 🖥️ PC (navegador) | consulta `up{vm="srv-a"}` | Os rótulos filtram uma VM específica |
-
-### G. Grafana
-
-| # | Onde rodar | Ação | Mostrar / explicar |
-|---|------------|------|--------------------|
-| 35 | 🖥️ PC | `ls grafana/provisioning grafana/dashboards` | Fonte de dados e dashboards como código, carregados automaticamente |
-| 36 | 🖥️ PC (navegador) | Dashboard *Infraestrutura das VMs* | Seção de infraestrutura: alvos, CPU, memória, rede, carga, disco |
-| 37 | 🖥️ PC (navegador) | Dashboard *Nginx e tráfego HTTP* | Seção HTTP: requisições, A × B, conexões |
-| 38 | 🖥️ PC | `for i in $(seq 200); do curl -s http://192.168.56.10/ > /dev/null; done` | Ao vivo: a taxa sobe e A e B ficam sobrepostos; a pizza fica em 50/50 |
-| 39 | 🖥️ PC (navegador) | Ícone ⓘ / *Edit* nos painéis de CPU, requisições e memória | Explicar as 3 consultas PromQL (seção 9.6) |
-| 40 | 🖥️ PC (navegador) | Painel de requisições sem tráfego | Linha de base de 0,2 req/s = o próprio exporter |
-
-### H. Experimentos (ao vivo)
-
-| # | Onde rodar | Comando | Mostrar / explicar |
-|---|------------|---------|--------------------|
-| 41 | 🖥️ PC | `alias hey='docker run --rm --network host williamyeh/hey'` | Ferramenta de carga |
-| 42 | 🖥️ PC | `hey -z 1m -c 5 -q 4 http://192.168.56.10/` | Cenário 1 rápido: A e B sobrepostos, pizza 50/50 |
-| 43 | 🖥️ PC + 📦 VM `srv-a` | `hey -z 2m -c 5 -q 4 http://192.168.56.10/` e, no meio, `sudo systemctl stop nginx` / `start nginx` | Cenário 3 ao vivo: B absorve tudo, `hey` sem erros, recuperação |
-| 44 | 📦 VM `lb` | `sudo tail -3 /var/log/nginx/error.log` | *Connection refused* espaçado de ~10 s (`fail_timeout`) |
-| 45 | README | Tabelas dos Cenários 2 e 4 | Saturação (Lei de Little) e comparação peso × round robin |
-
-### I. Repositório
-
-| # | Onde | O que mostrar |
-|---|------|---------------|
-| 46 | GitHub | Histórico de commits (uma etapa por commit) e as pastas `lb/`, `srv-a/`, `srv-b/`, `app/`, `nginx/`, `exporters/`, `prometheus/`, `grafana/` e o `docker-compose.yml` |
+| Melhoria | Como | Ganho |
+|----------|------|-------|
+| Reaproveitar conexões | `keepalive` no `upstream` | Menos latência e menos CPU |
+| Latência e erros no Prometheus | Processar os logs do Nginx ou instrumentar a aplicação | Gráficos de latência e de erros por código |
+| Gráficos mais "rápidos" | `rate` com janela menor (`[15s]`) | Eventos curtos aparecem com nitidez |
+| Alertas | Regras para `up == 0`, `nginx_up == 0`, CPU > 90% | Aviso automático em vez de ficar olhando o painel |
+| Relógios certos | `timedatectl set-ntp true` nas VMs | Logs comparáveis entre máquinas |
+| Distribuição adaptativa | `least_conn` | Se ajusta quando um servidor fica lento |
+| Mais capacidade | Mais vCPUs e mais processos (por exemplo, Gunicorn) ou um terceiro servidor | Aguentar mais antes de saturar |
 
 ---
 
-## Decisões técnicas (perguntas prováveis)
+## Por que fizemos assim
+
+Respostas para as perguntas que mais esperamos ouvir.
 
 **Por que NAT + host-only, e não bridge?**
-A host-only é uma rede só entre o PC e as VMs, com IPs que não dependem do roteador de casa ou da faculdade: o ambiente funciona igual em qualquer lugar. As VMs também não ficam expostas na rede local. A NAT serve apenas para a VM acessar a internet.
+A host-only é uma rede só entre o PC e as VMs, com IPs que não dependem do roteador de casa ou da faculdade. O ambiente funciona igual em qualquer lugar, e as VMs não ficam expostas na rede local. A NAT existe só para as VMs acessarem a internet.
 
 **Por que IP fixo?**
-Os IPs vão no `upstream` do Nginx e no `prometheus.yml`. Se mudassem (DHCP), essas configurações quebrariam. Ficam fora da faixa DHCP para não haver conflito.
+Os IPs estão escritos no `upstream` do Nginx e no `prometheus.yml`. Se mudassem, tudo quebraria.
 
-**Por que a host-only não tem gateway no netplan?**
-Uma máquina deve ter uma única rota padrão. Ela já vem pela NAT (DHCP), que é a única com saída para a internet.
+**Por que 1 vCPU?**
+É suficiente para o que roda nas VMs e faz a rota de carga saturar rápido, deixando os efeitos bem visíveis nos gráficos. A e B são idênticos para a comparação ser justa.
 
-**Por que 1 vCPU e pouca memória?**
-Suficiente para Nginx, aplicação e exporters. Com 1 vCPU, a rota de carga satura a CPU rapidamente e o efeito fica visível nos gráficos. `srv-a` e `srv-b` são idênticas para a comparação do balanceamento ser justa.
+**Por que clonar as VMs?**
+Para não repetir a instalação. Só tomamos o cuidado de trocar tudo que identifica a máquina: MAC, nome, machine-id, chaves SSH e IP.
 
-**Por que Ubuntu Server sem interface gráfica?**
-Consome menos CPU e RAM, e as métricas refletem só os serviços do projeto.
-
-**Por que clonar e o que foi trocado?**
-Para não repetir a instalação. Foram trocados MAC (conflito de rede), hostname, machine-id (identificador único da instalação), chaves SSH (identidade do servidor) e IP.
-
-**Por que a aplicação em Python sem framework?**
-Já vem no Ubuntu, sem dependências. Atende a todas as rotas pedidas com um arquivo só.
+**Por que Python sem framework?**
+Já vem no Ubuntu e resolve tudo com um arquivo só.
 
 **Por que systemd?**
-A aplicação sobe sozinha no boot, religa se cair e roda com um usuário sem privilégios (`www-data`).
+A aplicação sobe no boot, volta se cair e roda sem privilégios.
 
-**Por que um Nginx em cada servidor, e não o lb direto na aplicação?**
-O enunciado exige. Além disso, a aplicação fica isolada no loopback, e o Nginx de cada servidor fornece o `stub_status` para medir o tráfego de A e de B separadamente, o que permite comparar a distribuição do round robin.
+**Por que um Nginx em cada servidor?**
+O enunciado exige. Além disso, cada Nginx tem seu próprio `stub_status`, o que nos permite medir A e B separadamente e comparar a distribuição.
 
-**Por que o stub_status em 127.0.0.1:8080, separado do site?**
-Só o exporter da própria VM precisa lê-lo. Numa porta separada e no loopback, ele fica invisível para a rede e não se mistura com o tráfego da aplicação.
+**Por que o `upstream` aponta para a porta 80 e não para a 5000?**
+O balanceador deve falar com os Nginx dos servidores, não com a aplicação. E a 5000 só escuta por dentro de cada VM.
 
-**Por que a porta 80 dos servidores só aceita o lb?**
-Para que todo o tráfego passe pelo balanceador. Se o PC pudesse acessar A e B direto, haveria requisições fora do balanceamento e as métricas ficariam distorcidas.
+**Como funciona o round robin? Ele muda de servidor quando um fica sobrecarregado?**
+Ele percorre a lista em ordem: um para A, um para B, e assim por diante. **Não** olha a carga: no Cenário 2, ficou em 50/50 mesmo com os dois a 98%. Só desvia quando um servidor **falha**. Quem leva a carga em conta é o `least_conn`.
 
-**Por que o upstream aponta para a porta 80 e não para a 5000?**
-O enunciado exige que o balanceador fale com os Nginx dos servidores, não com a aplicação. E a 5000 só escuta em `127.0.0.1`, então nem seria alcançável pela rede.
-
-**Como funciona o round robin?**
-O Nginx percorre a lista do `upstream` em ordem: a 1ª requisição vai para A, a 2ª para B, a 3ª para A... É o padrão quando nenhum algoritmo é declarado. Funciona bem quando os servidores são iguais, como aqui.
-
-**O que acontece se um backend cair?**
-Com `proxy_connect_timeout 2s` e `proxy_next_upstream`, o `lb` desiste do servidor em até 2 s e reenvia a requisição para o outro; com `max_fails=1 fail_timeout=10s`, o servidor que falhou fica 10 s fora da rotação. (Será demonstrado no cenário 3.)
-
-**Por que a porta 80 do lb só aceita o PC?**
-O PC é o único cliente: é dele que saem os testes e o gerador de carga. Liberar só o necessário é o princípio do firewall do projeto.
+**Por que a porta 80 do `lb` só aceita o PC, e a dos servidores só aceita o `lb`?**
+Para liberar apenas o necessário e garantir que todo o tráfego passe pelo balanceador.
 
 **Por que dois exporters por VM?**
-Cada um mede uma coisa: o Node Exporter mede a máquina (CPU, memória, disco, rede); o Nginx Exporter mede o tráfego HTTP (requisições e conexões). Juntos, mostram o efeito da carga na infraestrutura e no serviço.
+Um mede a máquina (CPU, memória, disco, rede) e o outro mede o tráfego HTTP. Com os dois juntos, dá para ver o efeito da carga nos dois lados.
 
-**Por que o Nginx Exporter, se já existe o stub_status?**
-O `stub_status` é um texto simples que o Prometheus não sabe ler. O exporter o lê localmente e o converte para o formato de métricas do Prometheus.
+**Por que o `stub_status` fica escondido, mas os exporters ficam na rede?**
+O status só é lido pelo exporter da própria VM. Já os exporters precisam ser lidos pelo Prometheus, que está no PC; por isso escutam na rede, com o firewall liberando só o IP do PC.
 
-**Por que o stub_status fica local, mas os exporters ficam abertos à rede?**
-O `stub_status` só é lido pelo exporter da própria VM, então não precisa sair dela. Já os exporters precisam ser lidos pelo Prometheus, que roda no PC; por isso escutam na rede, com o firewall liberando apenas o IP do PC.
-
-**Por que instalar pelos pacotes do Ubuntu?**
-Já vêm com o serviço systemd configurado (sobe no boot, religa se cair) e são atualizados pelo `apt`. São as versões open source exigidas.
-
-**Por que o Prometheus no PC e em Docker?**
-O enunciado permite rodar no computador local, inclusive em contêiner. Com Docker, nada é instalado no PC e toda a configuração fica versionada; qualquer integrante sobe o mesmo ambiente com `docker compose up -d`.
+**Por que Prometheus e Grafana no PC, em Docker?**
+O enunciado permite, nada é instalado direto no computador, e tudo fica versionado.
 
 **Por que `network_mode: host`?**
-Os containers usam a rede do PC diretamente, então o Prometheus chega às VMs pela host-only com o IP `192.168.56.1`, exatamente o liberado no firewall dos exporters. Sem isso, o tráfego passaria por uma rede interna do Docker.
+Para o Prometheus sair para as VMs com o IP do PC, o mesmo que o firewall libera.
 
-**Para que servem os rótulos `vm` e `papel`?**
-O enunciado pede rótulos que distingam balanceador, servidor A e servidor B. Com eles, as consultas e os dashboards filtram por nome (`vm="srv-a"`) em vez de IP, e a legenda dos gráficos fica legível.
+**Por que coletar a cada 5 segundos?**
+O padrão de 1 minuto é lento demais para testes de poucos minutos.
 
-**Por que coletar a cada 5 s?**
-O padrão (1 min) é lento para testes de carga de poucos minutos. Com 5 s, as mudanças aparecem quase em tempo real, e o `rate(...[1m])` tem 12 amostras por janela.
+**Por que configurar o Grafana por arquivos?**
+Reprodutibilidade: ele sobe pronto, e os arquivos JSON já são a exportação pedida.
 
-**O que é a métrica `up`?**
-É criada pelo próprio Prometheus para cada alvo: 1 se a última coleta funcionou, 0 se falhou. É a base do painel de estado dos alvos.
+**Por que `rate` em alguns painéis e não em outros?**
+Contadores só crescem; o `rate` mostra a variação por segundo. Valores instantâneos, como carga ou memória, já dizem o que está acontecendo agora.
 
-**Por que provisionar o Grafana por arquivos, e não pela interface?**
-Reprodutibilidade: a fonte de dados e os dashboards ficam no repositório e são carregados ao subir o container. Os próprios arquivos JSON são a exportação exigida na entrega.
+**De onde vem a latência, se o Nginx não a fornece?**
+Do `hey`, que mede o tempo de cada requisição do lado do cliente.
 
-**Por que usar `rate` em alguns painéis e não em outros?**
-Contadores (`*_total`, `accepted`, `handled`) só crescem desde que o serviço ligou; o valor bruto não mostra o que acontece agora. `rate` calcula a variação por segundo. Gauges (`node_load1`, `nginx_connections_active`, memória) já são o valor do momento e são usados direto.
-
-**Por que aparecem 0,2 req/s sem ninguém acessando?**
-É o próprio monitoramento: o exporter lê o `stub_status` a cada 5 s, e cada leitura conta como uma requisição no Nginx (1 ÷ 5 = 0,2 req/s).
-
-**Por que o painel de rede filtra `device="enp0s8"`?**
-É a placa host-only, por onde passa todo o tráfego do projeto (balanceamento e coleta). A placa NAT só carrega atualizações do sistema e o loopback é interno.
-
-**Por que a vazão parou em ~53 req/s no Cenário 2?**
-Cada requisição em `/carga?n=50000` gasta ~40 ms de CPU, e cada backend tem 1 vCPU: ~26 req/s por backend, ~53 no total. Com a CPU em ~98%, mais clientes só aumentam a fila e a latência.
+**Por que a vazão parou em ~53 req/s?**
+Cada requisição de carga gasta ~40 ms de CPU, e cada servidor tem 1 vCPU: ~26 por servidor, ~53 no total.
 
 **Por que o cliente não viu erro quando o A caiu?**
-Com `proxy_next_upstream error timeout ...`, o `lb` reenviou a mesma requisição ao B ao receber *Connection refused*. Com `max_fails=1 fail_timeout=10s`, o A ficou 10 s fora da rotação após cada falha.
+Porque o `lb` reenviou a requisição para o B na hora e deixou o A de fora por 10 segundos a cada falha.
 
 **Por que o peso piorou o desempenho?**
-A e B são idênticos. Mandando 75% para o A, ele saturou enquanto o B ficou ocioso; a vazão total passou a ser limitada pela capacidade de um único servidor. Peso só faz sentido para servidores com capacidades diferentes.
-
-**De onde vem a latência, se o `stub_status` não a fornece?**
-Do gerador de carga (`hey`), que mede o tempo de cada requisição do ponto de vista do cliente.
-
-**Como vocês provam que a porta 5000 não é acessível?**
-`ss` mostra que ela escuta só em `127.0.0.1`, e o `curl` de fora (PC ou outra VM) falha por timeout, porque o firewall descarta o pacote.
+Com servidores iguais, o de peso maior satura e o outro fica ocioso.
 
 ---
 
-## Dificuldades e soluções
+## Tropeços no caminho
 
-| Problema | Causa | Solução |
-|----------|-------|---------|
-| Instalação falhou (`configure_apt`, "An error occurred") | Três VMs instalando ao mesmo tempo com 1 GB | Instalar uma por vez |
-| "Já existe uma VM com esse nome" ao recriar | VM removida com *Remove only*: a pasta ficou no disco | Apagar a pasta em *Preferences → Default Machine Folder* |
-| Interfaces confundidas | — | NAT = `10.0.2.x`; host-only = `192.168.56.x` (padrões do VirtualBox) |
-| nano abriu vazio / "is a directory" | Caminho sem o nome do arquivo, ou só o nome sem a pasta | Usar o caminho completo; Tab para completar |
-| `mv README.md GUIA.md` sobrescreveu um arquivo | Sem destino, o `mv` renomeia | O último argumento é sempre o destino (`.` = pasta atual) |
-| REMOTE HOST IDENTIFICATION HAS CHANGED | Chaves SSH regeneradas no clone; PC guardava a antiga | `ssh-keygen -R IP` no PC |
-| App instalada no `lb` por engano | Terminal conectado na VM errada | Conferir o hostname no prompt |
-| Nome saía só "Servidor" | `Environment=APP_NAME=Servidor A` é cortado no espaço | Aspas: `Environment="APP_NAME=Servidor A"` |
-| `curl` sem resposta logo após o `restart` | A aplicação ainda estava subindo | `systemctl status app` e `curl -v` |
-| `ufw: ERROR: Wrong number of arguments` | Faltou o número da porta na regra | `sudo ufw allow from 192.168.56.10 to any port 80 proto tcp` |
-| `curl: Protocol "htt" not supported` / `Bad hostname` | Erro de digitação (`htt://`, `=i` em vez de `-i`) | Conferir o comando; usar ↑ para editar o anterior |
-| `node_load1` do `srv-b` em ~2,5 com CPU ~10% | Atividade passageira após o boot (checagem de atualizações). `top`, `ps` (estado D) e `unattended-upgrades` não mostraram nada preso; a carga caiu sozinha (2,05 → 1,75 → 0,90). `nproc` e `free -m` confirmaram hardware idêntico em A e B | Esperar estabilizar antes dos experimentos |
-| Legendas cortadas nos painéis | Painéis baixos demais para a legenda em tabela | Altura maior nos painéis (JSON v2) |
-| `yay -S hey-bin` falhou (erro 403) | Pacote do AUR aponta para um endereço de download que não existe mais | Usar o `hey` pela imagem Docker `williamyeh/hey` |
-| `hey: -n cannot be less than -c` | Concorrência padrão do `hey` é 50 | Informar `-c` junto: `hey -n 20 -c 5 ...` |
-| Horários dos logs das VMs não batem com o PC | Relógios das VMs ~3–4 min atrasados, sem NTP | Correlacionar pelos gráficos (horário do Prometheus); melhoria: `timedatectl set-ntp true` |
-| Respostas do `for` grudadas numa linha só | `\;` antes do `echo`: a barra fez o `;` virar texto | `;` sem barra, ou filtrar com `grep -o` (uma resposta por linha) |
+Nem tudo funcionou de primeira. Registramos os problemas porque cada um ensinou alguma coisa:
+
+| O que aconteceu | Por quê | Como resolvemos |
+|-----------------|---------|-----------------|
+| O instalador do Ubuntu quebrou ("An error occurred") | Três VMs instalando ao mesmo tempo | Instalar uma de cada vez |
+| "Já existe uma VM com esse nome" ao recriar | A VM foi removida com *Remove only* e a pasta ficou no disco | Apagar a pasta em *Preferences → Default Machine Folder* |
+| Confundimos as placas de rede | — | Aprendemos que NAT é `10.0.2.x` e host-only é `192.168.56.x` |
+| O nano abriu um arquivo vazio | Faltou o caminho completo do arquivo | Usar o caminho inteiro e o Tab para completar |
+| Um `mv` apagou um arquivo | Sem destino, o `mv` renomeia um arquivo por cima do outro | O último argumento é sempre o destino |
+| `REMOTE HOST IDENTIFICATION HAS CHANGED` | As chaves SSH mudaram na clonagem | `ssh-keygen -R IP` no PC |
+| A aplicação foi parar no `lb` | Terminal conectado na VM errada | Olhar o prompt antes de cada comando |
+| O nome saía só "Servidor" | O systemd corta valores com espaço | Aspas: `Environment="APP_NAME=Servidor A"` |
+| O `curl` não respondeu logo após o `restart` | A aplicação ainda estava subindo | `systemctl status app` e `curl -v` |
+| `ufw: Wrong number of arguments` | Faltou a porta na regra | `... to any port 80 proto tcp` |
+| `Protocol "htt" not supported` | Erro de digitação | Seta ↑ para corrigir o comando anterior |
+| As respostas do `for` vieram grudadas | Uma `\` antes do `;` | `;` sem barra e `grep -o` para uma por linha |
+| Carga alta no `srv-b` sem uso de CPU | Atividade passageira após o boot | Investigamos com `top` e `ps`, confirmamos hardware igual e esperamos estabilizar |
+| As legendas dos painéis apareciam cortadas | Painéis baixos demais | Aumentamos a altura no JSON |
+| O pacote `hey-bin` do AUR falhou (erro 403) | O link de download não existe mais | Usar o `hey` em Docker |
+| `hey: -n cannot be less than -c` | O padrão do `hey` é 50 clientes | Informar `-c` junto |
+| Os horários dos logs não batiam | Os relógios das VMs estavam atrasados | Correlacionar pelos gráficos |
+| `docker: failed to connect ... docker.sock` | O Docker não sobe sozinho no Arch | `sudo systemctl start docker` e `enable` |
 
 ---
 
-## Entrega: checklist do enunciado
+## O que foi entregue
 
-| Item exigido | Onde está |
-|--------------|-----------|
+| O enunciado pede | Onde está |
+|------------------|-----------|
 | Ambiente completo e funcional | Etapas 1 a 9 |
-| Arquivos de configuração dos três Nginx | `nginx/backend.conf` (A e B) e `nginx/lb.conf` |
+| Configuração dos três Nginx | `nginx/backend.conf` e `nginx/lb.conf` |
 | `prometheus.yml` | `prometheus/prometheus.yml` |
-| Configurações dos exporters | `exporters/prometheus-nginx-exporter` (Node Exporter usa o padrão do pacote) |
+| Configuração dos exporters | `exporters/prometheus-nginx-exporter` (o Node Exporter usa o padrão) |
 | Docker Compose | `docker-compose.yml` |
-| Código-fonte da aplicação e instruções | `app/app.py`, `app/app.service` e Etapa 4 |
-| Dashboards do Grafana em JSON | `grafana/dashboards/infraestrutura.json` e `grafana/dashboards/nginx.json` |
-| Prints: seis alvos UP | `docs/prints/prom-targets.png`, `prom-query-up.png` |
-| Prints: distribuição das respostas | `docs/prints/lb-round-robin-limpo.png`, `exp1-nginx.png` |
-| Prints: testes de carga | `docs/prints/exp1-*`, `exp2-*`, `exp4-*` |
-| Prints: falha de um backend | `docs/prints/exp3-*` |
-| Ferramenta, duração e concorrência dos testes | Etapa 10, tabela "Resumo dos cenários" |
-| Explicar 3 consultas PromQL | Etapa 9, seção 9.6 |
-| Arquitetura, decisões, dificuldades, resultados, limitações e melhorias | Seções de Arquitetura, Decisões técnicas, Dificuldades e Análise |
-
-### Status
-
-- [x] VMs, rede, hostname, SSH e firewall
-- [x] Aplicação em A e B (somente loopback)
-- [x] Nginx em `srv-a` e `srv-b` (proxy reverso + `stub_status`)
-- [x] Nginx balanceador no `lb` (round robin + `stub_status`)
-- [x] Node Exporter e Nginx Exporter nas três VMs (acesso restrito ao PC)
-- [x] Prometheus: 6 alvos UP com rótulos
-- [x] Grafana: dashboards de infraestrutura e de Nginx/HTTP
-- [x] Experimentos: normal, aumento de carga, falha de backend, estratégia alternativa
-- [ ] Ensaiar a demonstração com todos os integrantes
+| Código da aplicação e como executá-la | `app/` e Etapa 4 |
+| Dashboards em JSON | `grafana/dashboards/` |
+| Prints dos seis alvos UP | `prom-targets.png`, `prom-query-up.png` |
+| Prints da distribuição | `lb-round-robin-limpo.png`, `exp1-nginx.png` |
+| Prints dos testes de carga | `exp1-*`, `exp2-*`, `exp4-*` |
+| Prints da falha de um backend | `exp3-*` |
+| Ferramenta, duração e concorrência dos testes | Etapa 10, tabela dos cenários |
+| Explicar três consultas PromQL | Etapa 9, "Três consultas explicadas em detalhe" |
+| Arquitetura, decisões, dificuldades, resultados, limitações e melhorias | Visão geral, "Por que fizemos assim", "Tropeços no caminho" e "O que aprendemos" |
